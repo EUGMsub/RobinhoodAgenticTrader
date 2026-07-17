@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# secrets — never commit these
+.env
+*.key
+
+# runtime artifacts
+trade_log.jsonl
+cron.log
+
+.DS_Store
