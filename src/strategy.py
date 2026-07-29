@@ -27,7 +27,12 @@ STRATEGY (mean-reversion dip-buy):
    - it is down {cfg.dip_trigger_pct:.2f}% or more today, AND
    - current position value in that ticker is under
      ${cfg.max_position_dollars:.2f}, AND
-   - total account exposure is under ${cfg.max_total_dollars:.2f}.
+   - total account exposure is under ${cfg.max_total_dollars:.2f}, AND
+   - the ticker's correlation group(s) (e.g. {dict(cfg.correlation_groups)})
+     would stay under ${cfg.max_group_dollars:.2f} combined exposure after
+     the buy. Correlated tickers can all dip together, so this cap exists
+     to stop several "diversified" positions from becoming one concentrated
+     bet — check it even when the per-ticker and total caps are satisfied.
 3. SELL an entire position if ANY of the following exit conditions are met
    (get days_held for each position from the MCP tax lots tool):
    - profit_target: current price is {cfg.revert_target_pct:.2f}% or more
@@ -64,9 +69,12 @@ def build_approval_mode_instruction() -> str:
         "'proposed_orders'. Each entry must include: ticker, side "
         "('buy'|'sell'), dollars, reason, and the raw numbers that justify "
         "it so they can be independently re-checked — for a buy: "
-        "day_change_pct, current_position_value, current_total_exposure; "
-        "for a sell: current_price, avg_cost, and days_held (sourced from "
-        "the MCP tax lots tool). Empty list if no trades."
+        "day_change_pct and positions (an object mapping every held ticker "
+        "to its current market value, so per-ticker, group, and total "
+        "exposure can all be derived independently rather than trusted "
+        "from your arithmetic); for a sell: current_price, avg_cost, and "
+        "days_held (sourced from the MCP tax lots tool). Empty list if no "
+        "trades."
     )
 
 

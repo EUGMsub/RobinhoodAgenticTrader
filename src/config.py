@@ -8,8 +8,9 @@ so it's obvious, reviewable, and testable.
 
 import os
 from dataclasses import dataclass, field
+from typing import Mapping
 
-from guardrails import GuardrailConfig
+from guardrails import DEFAULT_CORRELATION_GROUPS, GuardrailConfig
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,14 @@ class AgentConfig:
     max_total_dollars: float = 400.0
     max_hold_days: int = 10
     disaster_stop_pct: float = 15.0
+    correlation_groups: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: DEFAULT_CORRELATION_GROUPS
+    )
+    max_group_dollars: float = 200.0
+
+    # --- backtest-only parameters (not part of live guardrails) ---
+    slippage_pct: float = 0.05
+    initial_cash: float = 400.0
 
     # --- operational parameters ---
     approval_mode: bool = True
@@ -33,6 +42,9 @@ class AgentConfig:
     anthropic_api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
     mcp_url: str = field(default_factory=lambda: os.environ.get("ROBINHOOD_MCP_URL", ""))
     mcp_token: str = field(default_factory=lambda: os.environ.get("ROBINHOOD_MCP_TOKEN", ""))
+    agentic_account_number: str = field(
+        default_factory=lambda: os.environ.get("ROBINHOOD_ACCOUNT_NUMBER", "")
+    )
 
     def guardrail_config(self) -> GuardrailConfig:
         return GuardrailConfig(
@@ -44,6 +56,8 @@ class AgentConfig:
             revert_target_pct=self.revert_target_pct,
             max_hold_days=self.max_hold_days,
             disaster_stop_pct=self.disaster_stop_pct,
+            correlation_groups=self.correlation_groups,
+            max_group_dollars=self.max_group_dollars,
         )
 
     def validate(self) -> None:
@@ -53,6 +67,7 @@ class AgentConfig:
                 ("ANTHROPIC_API_KEY", self.anthropic_api_key),
                 ("ROBINHOOD_MCP_URL", self.mcp_url),
                 ("ROBINHOOD_MCP_TOKEN", self.mcp_token),
+                ("ROBINHOOD_ACCOUNT_NUMBER", self.agentic_account_number),
             ]
             if not val
         ]

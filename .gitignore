@@ -13,4 +13,7 @@ env/
 trade_log.jsonl
 cron.log
 
+# fetched/generated backtest data
+data/
+
 .DS_Store
