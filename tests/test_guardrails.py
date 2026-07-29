@@ -20,6 +20,8 @@ CFG = GuardrailConfig(
     max_total_dollars=400.0,
     dip_trigger_pct=2.0,
     revert_target_pct=3.0,
+    max_hold_days=10,
+    disaster_stop_pct=15.0,
 )
 
 
@@ -97,26 +99,80 @@ class TestValidateBuy:
 
 class TestValidateSell:
     def test_approves_qualifying_revert(self):
-        result = validate_sell(CFG, "AAPL", current_price=103.0, avg_cost=100.0)
+        result = validate_sell(
+            CFG, "AAPL", current_price=103.0, avg_cost=100.0, days_held=1
+        )
         assert result.approved
+        assert "profit_target" in result.reason
 
     def test_rejects_insufficient_gain(self):
-        result = validate_sell(CFG, "AAPL", current_price=101.0, avg_cost=100.0)
+        result = validate_sell(
+            CFG, "AAPL", current_price=101.0, avg_cost=100.0, days_held=1
+        )
         assert not result.approved
 
     def test_rejects_off_watchlist_ticker(self):
-        result = validate_sell(CFG, "GME", current_price=200.0, avg_cost=100.0)
+        result = validate_sell(
+            CFG, "GME", current_price=200.0, avg_cost=100.0, days_held=1
+        )
         assert not result.approved
         assert "watchlist" in result.reason
 
     def test_rejects_zero_or_negative_cost_basis(self):
-        result = validate_sell(CFG, "AAPL", current_price=103.0, avg_cost=0)
+        result = validate_sell(
+            CFG, "AAPL", current_price=103.0, avg_cost=0, days_held=1
+        )
         assert not result.approved
 
     def test_boundary_exactly_at_target_is_approved(self):
-        result = validate_sell(CFG, "MSFT", current_price=103.0, avg_cost=100.0)
+        result = validate_sell(
+            CFG, "MSFT", current_price=103.0, avg_cost=100.0, days_held=1
+        )
         assert result.approved
+        assert "profit_target" in result.reason
 
-    def test_loss_position_never_approved(self):
-        result = validate_sell(CFG, "VOO", current_price=90.0, avg_cost=100.0)
+    # --- time_exit ---
+
+    def test_time_exit_approves_losing_position_past_max_hold(self):
+        result = validate_sell(
+            CFG, "VOO", current_price=95.0, avg_cost=100.0, days_held=10
+        )
+        assert result.approved
+        assert "time_exit" in result.reason
+
+    def test_boundary_exactly_at_max_hold_days_is_approved(self):
+        result = validate_sell(
+            CFG, "VOO", current_price=98.0, avg_cost=100.0, days_held=10
+        )
+        assert result.approved
+        assert "time_exit" in result.reason
+
+    def test_rejects_below_max_hold_days_with_no_other_exit(self):
+        result = validate_sell(
+            CFG, "VOO", current_price=98.0, avg_cost=100.0, days_held=9
+        )
+        assert not result.approved
+
+    # --- disaster_stop ---
+
+    def test_disaster_stop_approves_regardless_of_hold_time(self):
+        result = validate_sell(
+            CFG, "AAPL", current_price=84.0, avg_cost=100.0, days_held=1
+        )
+        assert result.approved
+        assert "disaster_stop" in result.reason
+
+    def test_boundary_exactly_at_disaster_stop_pct_is_approved(self):
+        result = validate_sell(
+            CFG, "AAPL", current_price=85.0, avg_cost=100.0, days_held=1
+        )
+        assert result.approved
+        assert "disaster_stop" in result.reason
+
+    # --- must still be rejected ---
+
+    def test_rejects_loss_under_max_hold_and_above_disaster_stop(self):
+        result = validate_sell(
+            CFG, "VOO", current_price=90.0, avg_cost=100.0, days_held=5
+        )
         assert not result.approved

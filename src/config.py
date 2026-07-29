@@ -21,6 +21,8 @@ class AgentConfig:
     order_dollars: float = 25.0
     max_position_dollars: float = 150.0
     max_total_dollars: float = 400.0
+    max_hold_days: int = 10
+    disaster_stop_pct: float = 15.0
 
     # --- operational parameters ---
     approval_mode: bool = True
@@ -40,6 +42,8 @@ class AgentConfig:
             max_total_dollars=self.max_total_dollars,
             dip_trigger_pct=self.dip_trigger_pct,
             revert_target_pct=self.revert_target_pct,
+            max_hold_days=self.max_hold_days,
+            disaster_stop_pct=self.disaster_stop_pct,
         )
 
     def validate(self) -> None:

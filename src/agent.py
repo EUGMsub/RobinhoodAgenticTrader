@@ -121,6 +121,7 @@ def run_cycle(cfg: AgentConfig, client: anthropic.Anthropic | None = None) -> st
                 ticker=ticker,
                 current_price=float(order.get("current_price", 0)),
                 avg_cost=float(order.get("avg_cost", 0)),
+                days_held=int(order.get("days_held", 0)),
             )
         else:
             result = None

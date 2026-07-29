@@ -26,6 +26,8 @@ class GuardrailConfig:
     max_total_dollars: float
     dip_trigger_pct: float
     revert_target_pct: float
+    max_hold_days: int = 10
+    disaster_stop_pct: float = 15.0
 
 
 @dataclass(frozen=True)
@@ -97,8 +99,18 @@ def validate_sell(
     ticker: str,
     current_price: float,
     avg_cost: float,
+    days_held: int,
 ) -> GuardrailResult:
-    """Validate a proposed full-position SELL order."""
+    """Validate a proposed full-position SELL order.
+
+    A sale is approved if ANY exit condition is met:
+      - profit_target: price has reverted to the target gain
+      - time_exit: the position has been held at least max_hold_days
+      - disaster_stop: price has fallen to the disaster stop loss
+
+    This guarantees a losing position is never held indefinitely — either
+    it reverts, or it is force-exited by time or by the disaster stop.
+    """
     ticker = ticker.upper().strip()
 
     if ticker not in cfg.watchlist:
@@ -109,13 +121,31 @@ def validate_sell(
 
     gain_pct = ((current_price - avg_cost) / avg_cost) * 100
 
-    if gain_pct < cfg.revert_target_pct - 1e-9:
+    if gain_pct >= cfg.revert_target_pct - 1e-9:
         return GuardrailResult(
-            False,
-            f"{ticker} is only up {gain_pct:.2f}%, "
-            f"below the {cfg.revert_target_pct:.2f}% revert target",
+            True,
+            f"profit_target: {ticker} up {gain_pct:.2f}%, "
+            f"meets the {cfg.revert_target_pct:.2f}% revert target",
+        )
+
+    if days_held >= cfg.max_hold_days:
+        return GuardrailResult(
+            True,
+            f"time_exit: {ticker} held {days_held} days, "
+            f"at or beyond the {cfg.max_hold_days}-day max hold",
+        )
+
+    if gain_pct <= -cfg.disaster_stop_pct + 1e-9:
+        return GuardrailResult(
+            True,
+            f"disaster_stop: {ticker} down {gain_pct:.2f}%, "
+            f"at or beyond the {cfg.disaster_stop_pct:.2f}% disaster stop",
         )
 
     return GuardrailResult(
-        True, f"{ticker} up {gain_pct:.2f}%, meets the revert target"
+        False,
+        f"{ticker} is {gain_pct:.2f}% from cost basis (target "
+        f"{cfg.revert_target_pct:.2f}%, disaster stop "
+        f"-{cfg.disaster_stop_pct:.2f}%), held {days_held}/"
+        f"{cfg.max_hold_days} days — no exit condition met",
     )

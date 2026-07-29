@@ -28,8 +28,15 @@ STRATEGY (mean-reversion dip-buy):
    - current position value in that ticker is under
      ${cfg.max_position_dollars:.2f}, AND
    - total account exposure is under ${cfg.max_total_dollars:.2f}.
-3. SELL an entire position ONLY IF its current price is
-   {cfg.revert_target_pct:.2f}% or more above the average cost basis.
+3. SELL an entire position if ANY of the following exit conditions are met
+   (get days_held for each position from the MCP tax lots tool):
+   - profit_target: current price is {cfg.revert_target_pct:.2f}% or more
+     above the average cost basis.
+   - time_exit: the position has been held for {cfg.max_hold_days} days or
+     more, regardless of price.
+   - disaster_stop: current price is {cfg.disaster_stop_pct:.2f}% or more
+     below the average cost basis. This exists specifically so a losing
+     position is never held indefinitely.
 4. If no condition is met, DO NOTHING. Doing nothing is the correct and
    expected outcome on most days.
 
@@ -58,7 +65,8 @@ def build_approval_mode_instruction() -> str:
         "('buy'|'sell'), dollars, reason, and the raw numbers that justify "
         "it so they can be independently re-checked — for a buy: "
         "day_change_pct, current_position_value, current_total_exposure; "
-        "for a sell: current_price, avg_cost. Empty list if no trades."
+        "for a sell: current_price, avg_cost, and days_held (sourced from "
+        "the MCP tax lots tool). Empty list if no trades."
     )
 
 
