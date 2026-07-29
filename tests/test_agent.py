@@ -28,15 +28,28 @@ from config import AgentConfig
 from paper_trading import load_paper_portfolio
 
 
+_UNSET = object()
+
+
 class _FakeBlock:
     def __init__(self, text):
         self.type = "text"
         self.text = text
 
 
+class _FakeUsage:
+    def __init__(self, input_tokens, output_tokens, **cache_fields):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        for name, value in cache_fields.items():
+            setattr(self, name, value)
+
+
 class _FakeResponse:
-    def __init__(self, text):
+    def __init__(self, text, usage=None):
         self.content = [_FakeBlock(text)]
+        if usage is not None:
+            self.usage = usage
 
 
 class _FakeMessages:
@@ -91,8 +104,15 @@ def _cfg(tmp_path, **overrides):
     return AgentConfig(**defaults)
 
 
-def _cycle_report(proposed_orders):
+def _cycle_report(proposed_orders, market_snapshot=_UNSET):
     payload = {"proposed_orders": proposed_orders}
+    if market_snapshot is _UNSET:
+        # Default to a complete snapshot for the single-ticker AAPL
+        # watchlist these tests use, so snapshot handling doesn't
+        # accidentally become the subject of every unrelated test.
+        market_snapshot = {"AAPL": {"current_price": 100.0, "day_change_pct": -5.0}}
+    if market_snapshot is not None:
+        payload["market_snapshot"] = market_snapshot
     return f"Here's what I found.\n```json\n{json.dumps(payload)}\n```\n"
 
 
@@ -623,3 +643,153 @@ class TestNoExecuteDirectlyInstructionAnywhere:
 
         prompt = client.beta.messages.calls[0]["messages"][0]["content"]
         assert "execute qualifying orders directly" not in prompt.lower()
+
+
+class TestMarketSnapshotLogging:
+    """A no-trade day and a broken-tool day both produce zero orders. The
+    snapshot event is what tells them apart after the fact."""
+
+    def test_snapshot_is_logged_on_a_cycle_with_no_proposals(self, tmp_path):
+        cfg = _cfg(tmp_path, dry_run=True)
+        snapshot = {"AAPL": {"current_price": 187.42, "day_change_pct": -1.13}}
+        client = _FakeClient([_FakeResponse(_cycle_report([], market_snapshot=snapshot))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        snapshots = [e for e in events if e["event"] == "market_snapshot"]
+        assert len(snapshots) == 1
+        assert snapshots[0]["snapshot"]["AAPL"]["current_price"] == 187.42
+        assert snapshots[0]["snapshot"]["AAPL"]["day_change_pct"] == -1.13
+        # A complete snapshot must NOT also raise the incomplete signal.
+        assert not any(e["event"] == "market_snapshot_incomplete" for e in events)
+
+    def test_missing_ticker_produces_the_incomplete_event(self, tmp_path):
+        # Watchlist is AAPL + MSFT; the model only reported AAPL.
+        cfg = _cfg(tmp_path, watchlist=("AAPL", "MSFT"), dry_run=True)
+        snapshot = {"AAPL": {"current_price": 187.42, "day_change_pct": -1.13}}
+        client = _FakeClient([_FakeResponse(_cycle_report([], market_snapshot=snapshot))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        incomplete = [e for e in events if e["event"] == "market_snapshot_incomplete"]
+        assert len(incomplete) == 1
+        assert incomplete[0]["missing_tickers"] == ["MSFT"]
+        # The partial snapshot is still logged — partial data beats none.
+        assert any(e["event"] == "market_snapshot" for e in events)
+
+    def test_absent_snapshot_object_produces_the_incomplete_event(self, tmp_path):
+        cfg = _cfg(tmp_path, dry_run=True)
+        client = _FakeClient([_FakeResponse(_cycle_report([], market_snapshot=None))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        incomplete = [e for e in events if e["event"] == "market_snapshot_incomplete"]
+        assert len(incomplete) == 1
+        assert incomplete[0]["missing_tickers"] == ["AAPL"]
+        assert not any(e["event"] == "market_snapshot" for e in events)
+
+    def test_snapshot_is_logged_even_when_orders_are_proposed(self, tmp_path):
+        cfg = _cfg(tmp_path, dry_run=True)
+        client = _FakeClient([_FakeResponse(_cycle_report([_approved_buy_order()]))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        assert any(e["event"] == "market_snapshot" for e in events)
+
+
+class TestApiUsageLogging:
+    def test_usage_is_logged_with_correct_cost_arithmetic(self, tmp_path):
+        cfg = _cfg(
+            tmp_path,
+            dry_run=True,
+            input_token_price_per_mtok=3.0,
+            output_token_price_per_mtok=15.0,
+        )
+        usage = _FakeUsage(input_tokens=1_000_000, output_tokens=200_000)
+        client = _FakeClient([_FakeResponse(_cycle_report([]), usage=usage)])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        usages = [e for e in events if e["event"] == "api_usage"]
+        assert len(usages) == 1
+        entry = usages[0]
+        assert entry["call"] == "proposal"
+        assert entry["input_tokens"] == 1_000_000
+        assert entry["output_tokens"] == 200_000
+        # 1.0 Mtok in @ $3 + 0.2 Mtok out @ $15 = 3.00 + 3.00 = 6.00
+        assert entry["estimated_cost_usd"] == pytest.approx(6.0)
+
+    def test_cache_token_fields_are_captured_when_present(self, tmp_path):
+        cfg = _cfg(tmp_path, dry_run=True)
+        usage = _FakeUsage(
+            input_tokens=100,
+            output_tokens=50,
+            cache_creation_input_tokens=2048,
+            cache_read_input_tokens=4096,
+        )
+        client = _FakeClient([_FakeResponse(_cycle_report([]), usage=usage)])
+
+        run_cycle(cfg, client=client)
+
+        entry = [e for e in _read_log_events(cfg.log_file) if e["event"] == "api_usage"][0]
+        assert entry["cache_creation_input_tokens"] == 2048
+        assert entry["cache_read_input_tokens"] == 4096
+
+    def test_cache_fields_are_omitted_when_absent_rather_than_zeroed(self, tmp_path):
+        # Reporting 0 for a call that never used caching would misrepresent
+        # it as "cached nothing" instead of "caching not in play".
+        cfg = _cfg(tmp_path, dry_run=True)
+        usage = _FakeUsage(input_tokens=100, output_tokens=50)
+        client = _FakeClient([_FakeResponse(_cycle_report([]), usage=usage)])
+
+        run_cycle(cfg, client=client)
+
+        entry = [e for e in _read_log_events(cfg.log_file) if e["event"] == "api_usage"][0]
+        assert "cache_read_input_tokens" not in entry
+        assert "cache_creation_input_tokens" not in entry
+
+    def test_each_call_is_attributed_separately(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        monkeypatch.setattr(agent_module, "confirm_with_human", lambda prompt: True)
+
+        cfg = _cfg(tmp_path, dry_run=False, approval_mode=True)
+        client = _FakeClient(
+            [
+                _FakeResponse(
+                    _cycle_report([_approved_buy_order()]),
+                    usage=_FakeUsage(input_tokens=1000, output_tokens=100),
+                ),
+                _FakeResponse(
+                    "Order placed.",
+                    usage=_FakeUsage(input_tokens=2000, output_tokens=200),
+                ),
+                _FakeResponse(
+                    _reconcile_report(
+                        [{"symbol": "AAPL", "side": "buy", "dollar_amount": 25.0}], []
+                    ),
+                    usage=_FakeUsage(input_tokens=3000, output_tokens=300),
+                ),
+            ]
+        )
+
+        run_cycle(cfg, client=client)
+
+        usages = [e for e in _read_log_events(cfg.log_file) if e["event"] == "api_usage"]
+        assert [u["call"] for u in usages] == ["proposal", "execution", "reconciliation"]
+        assert [u["input_tokens"] for u in usages] == [1000, 2000, 3000]
+
+    def test_missing_usage_object_is_tolerated(self, tmp_path):
+        # An SDK/mock without .usage must not crash a live trading cycle.
+        cfg = _cfg(tmp_path, dry_run=True)
+        client = _FakeClient([_FakeResponse(_cycle_report([]))])  # no usage
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        assert not any(e["event"] == "api_usage" for e in events)

@@ -38,6 +38,19 @@ class AgentConfig:
     model: str = "claude-sonnet-4-6"
     log_file: str = "trade_log.jsonl"
 
+    # --- API cost accounting ---
+    # NOT AUTHORITATIVE. These are operator-supplied estimates used only to
+    # attach an approximate dollar figure to logged token counts, so cost
+    # can be compared against P&L. They are not fetched from Anthropic and
+    # will drift as pricing changes or as you change `model` above.
+    # Verify the current rates for your model at
+    # docs.claude.com/en/docs/about-claude/pricing and update these
+    # yourself. The raw input_tokens/output_tokens in each api_usage event
+    # are the ground truth; the dollar figure is derived from these numbers
+    # and is only as accurate as they are.
+    input_token_price_per_mtok: float = 3.00
+    output_token_price_per_mtok: float = 15.00
+
     # --- dry-run (paper trading) parameters ---
     # dry_run never prompts for approval and never places an order (see
     # agent.py) — it simulates fills against a persisted paper portfolio so

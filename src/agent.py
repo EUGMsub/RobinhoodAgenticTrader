@@ -129,6 +129,115 @@ def _parse_proposed_orders(text: str) -> list[dict]:
         return []
 
 
+def _parse_market_snapshot(text: str) -> dict | None:
+    """Extract the model's per-ticker quote snapshot from a cycle report.
+
+    Returns None (not {}) when the block is missing or unparseable, so the
+    caller can distinguish "the model reported an empty snapshot" from
+    "there was no snapshot at all" — both are failures, but only the
+    second means the response itself was malformed.
+    """
+    if "```json" not in text:
+        return None
+    try:
+        raw = text.split("```json")[1].split("```")[0]
+        snapshot = json.loads(raw).get("market_snapshot")
+    except (json.JSONDecodeError, IndexError):
+        return None
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _log_market_snapshot(cfg: AgentConfig, text: str) -> None:
+    """Log what the model actually saw this cycle, every cycle.
+
+    Without this, a no-trade day is indistinguishable from a broken tool
+    call: both produce zero orders. Logging the snapshot unconditionally
+    means "fetched real prices, nothing qualified" leaves evidence, and a
+    missing or partial snapshot raises a loud, specific signal instead of
+    looking like a quiet, uneventful day.
+    """
+    snapshot = _parse_market_snapshot(text)
+
+    if snapshot is None:
+        print(
+            "\n*** WARNING: no market_snapshot in this cycle's response — "
+            "cannot confirm the agent actually fetched market data. Treat "
+            "this cycle's inaction as UNEXPLAINED, not as 'nothing "
+            "qualified'. ***"
+        )
+        log_event(
+            cfg.log_file,
+            "market_snapshot_incomplete",
+            missing_tickers=list(cfg.watchlist),
+            reason="no market_snapshot object in the model's response",
+        )
+        return
+
+    normalized = {str(t).upper().strip(): v for t, v in snapshot.items()}
+    missing = [t for t in cfg.watchlist if t.upper().strip() not in normalized]
+
+    log_event(cfg.log_file, "market_snapshot", snapshot=normalized)
+
+    if missing:
+        print(
+            f"\n*** WARNING: market_snapshot is missing {', '.join(missing)} "
+            "— the agent may not have successfully fetched quotes for "
+            "every watchlist ticker this cycle. ***"
+        )
+        log_event(
+            cfg.log_file,
+            "market_snapshot_incomplete",
+            missing_tickers=missing,
+            reason="watchlist tickers absent from the model's market_snapshot",
+        )
+
+
+def _log_api_usage(cfg: AgentConfig, call: str, response) -> None:
+    """Record token usage and an ESTIMATED dollar cost for one API call.
+
+    `call` names which step spent the tokens (proposal / execution /
+    reconciliation) so cost can be attributed rather than just totalled.
+    The dollar figure is derived from operator-supplied prices in
+    AgentConfig and is an estimate; the token counts are the ground truth.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+
+    def _tokens(name: str) -> int:
+        value = getattr(usage, name, None)
+        return int(value) if isinstance(value, (int, float)) else 0
+
+    input_tokens = _tokens("input_tokens")
+    output_tokens = _tokens("output_tokens")
+
+    cost = (
+        input_tokens / 1_000_000 * cfg.input_token_price_per_mtok
+        + output_tokens / 1_000_000 * cfg.output_token_price_per_mtok
+    )
+
+    fields = {
+        "call": call,
+        "model": cfg.model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "estimated_cost_usd": cost,
+    }
+
+    # Cache fields only exist when prompt caching is in play. Record them
+    # when present — they're a large part of real cost — but don't invent
+    # zeros for them, which would misrepresent a non-caching call.
+    for cache_field in (
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ):
+        value = getattr(usage, cache_field, None)
+        if isinstance(value, (int, float)):
+            fields[cache_field] = int(value)
+
+    log_event(cfg.log_file, "api_usage", **fields)
+
+
 def _parse_order_records(text: str) -> tuple[list[dict], list[dict]]:
     if "```json" not in text:
         return [], []
@@ -195,6 +304,7 @@ def _execute_and_reconcile(
         tools=_mcp_toolset(EXECUTION_TOOLS),
         betas=[MCP_BETA_HEADER],
     )
+    _log_api_usage(cfg, "execution", exec_response)
     exec_text = _extract_text(exec_response)
     print(f"\nEXECUTION RESULT:\n{exec_text}")
 
@@ -240,6 +350,7 @@ def _execute_and_reconcile(
         tools=_mcp_toolset(RECONCILE_TOOLS),
         betas=[MCP_BETA_HEADER],
     )
+    _log_api_usage(cfg, "reconciliation", reconcile_response)
     reconcile_text = _extract_text(reconcile_response)
     equity_orders, option_orders = _parse_order_records(reconcile_text)
     reconciliation = reconcile_order(order, equity_orders, option_orders)
@@ -326,6 +437,10 @@ def _run_dry_run_cycle(cfg: AgentConfig, gcfg, proposed: list[dict]) -> None:
             dollars=dollars,
             simulated_price=price,
             reason=result.reason,
+            # The originating proposal, carried through so the model's own
+            # stated numbers can later be compared against the guardrail's
+            # verdict for this same order.
+            order=order,
         )
 
     save_paper_portfolio(cfg.paper_portfolio_file, portfolio)
@@ -369,9 +484,14 @@ def run_cycle(cfg: AgentConfig, client: anthropic.Anthropic | None = None) -> st
         tools=_mcp_toolset(READ_ONLY_TOOLS),
         betas=[MCP_BETA_HEADER],
     )
+    _log_api_usage(cfg, "proposal", response)
 
     text = _extract_text(response)
     log_event(cfg.log_file, "cycle_report", report=text)
+
+    # Log what the model saw BEFORE any validation or early return, so a
+    # zero-order cycle still leaves proof that data was actually fetched.
+    _log_market_snapshot(cfg, text)
 
     proposed = _parse_proposed_orders(text)
     if not proposed:

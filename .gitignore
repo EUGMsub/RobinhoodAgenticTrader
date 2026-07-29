@@ -14,6 +14,10 @@ trade_log.jsonl
 cron.log
 paper_portfolio.json
 
+# generated dashboard + exports
+dashboard.html
+trades.csv
+
 # fetched/generated backtest data
 data/
 
