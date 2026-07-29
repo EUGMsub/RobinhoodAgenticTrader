@@ -12,6 +12,7 @@ env/
 # runtime artifacts
 trade_log.jsonl
 cron.log
+paper_portfolio.json
 
 # fetched/generated backtest data
 data/

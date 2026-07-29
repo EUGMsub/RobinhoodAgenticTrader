@@ -69,17 +69,10 @@ def build_approval_mode_instruction() -> str:
         "'proposed_orders'. Each entry must include: ticker, side "
         "('buy'|'sell'), dollars, reason, and the raw numbers that justify "
         "it so they can be independently re-checked — for a buy: "
-        "day_change_pct and positions (an object mapping every held ticker "
-        "to its current market value, so per-ticker, group, and total "
-        "exposure can all be derived independently rather than trusted "
-        "from your arithmetic); for a sell: current_price, avg_cost, and "
-        "days_held (sourced from the MCP tax lots tool). Empty list if no "
-        "trades."
-    )
-
-
-def build_execution_mode_instruction() -> str:
-    return (
-        "Execute qualifying orders directly via the MCP tools, respecting "
-        "every hard rule."
+        "current_price, day_change_pct, and positions (an object mapping "
+        "every held ticker to its current market value, so per-ticker, "
+        "group, and total exposure can all be derived independently "
+        "rather than trusted from your arithmetic); for a sell: "
+        "current_price, avg_cost, and days_held (sourced from the MCP tax "
+        "lots tool). Empty list if no trades."
     )

@@ -38,6 +38,14 @@ class AgentConfig:
     model: str = "claude-sonnet-4-6"
     log_file: str = "trade_log.jsonl"
 
+    # --- dry-run (paper trading) parameters ---
+    # dry_run never prompts for approval and never places an order (see
+    # agent.py) — it simulates fills against a persisted paper portfolio so
+    # successive runs accumulate a track record without touching a real
+    # (or real-but-unfunded) account.
+    dry_run: bool = False
+    paper_portfolio_file: str = "paper_portfolio.json"
+
     # --- credentials (populated from environment, never hardcoded) ---
     anthropic_api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
     mcp_url: str = field(default_factory=lambda: os.environ.get("ROBINHOOD_MCP_URL", ""))
