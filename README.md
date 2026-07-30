@@ -195,6 +195,14 @@ Stated plainly because they're real, and because a reviewer will find them.
     MCP connection) rather than through `run_agent.py` standalone. The fix — a
     proper OAuth authorization-code flow with token refresh — is not yet
     implemented.
+12. **The MCP beta header was wrong for an unknown period, caught only by a
+    real API call.** `MCP_BETA_HEADER` was set to `mcp-client-2025-11-25`,
+    which the Anthropic API rejects outright with a 400. All 139 tests passed
+    anyway, because every test uses a fake client that never sends a real
+    header — the bug was invisible to the entire suite. Fixed to the
+    documented `mcp-client-2025-11-20`. A note on the limits of mocked
+    testing: a wrong constant that's never exercised against the real API can
+    sit behind full test coverage indefinitely.
 
 ## Setup
 

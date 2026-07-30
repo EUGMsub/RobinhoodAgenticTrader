@@ -61,7 +61,10 @@ from paper_trading import (
 from reconcile import reconcile_order
 from strategy import build_approval_mode_instruction, build_system_prompt
 
-MCP_BETA_HEADER = "mcp-client-2025-11-25"
+# Verified against platform.claude.com/docs/en/agents-and-tools/mcp-connector
+# on 2026-07-30 — "mcp-client-2025-11-20" is the current value; the previous
+# "mcp-client-2025-11-25" was never valid and the API rejects it with a 400.
+MCP_BETA_HEADER = "mcp-client-2025-11-20"
 MCP_SERVER_NAME = "robinhood-trading"
 
 # Verified against the live Robinhood Trading MCP tool list — not guessed.
