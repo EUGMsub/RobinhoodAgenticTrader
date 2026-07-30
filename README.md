@@ -187,14 +187,24 @@ Stated plainly because they're real, and because a reviewer will find them.
 10. **The effective account cap is $200, not $400.** With every watchlist
     ticker in one correlation group and `max_group_dollars = 200`,
     `max_total_dollars = 400` can never bind.
-11. **`run_agent.py`'s static-token auth cannot work as designed — confirmed,
-    not suspected.** Robinhood's Agentic Trading MCP uses OAuth with
-    short-lived tokens issued to a client, so a static bearer token pasted
-    into `.env` as `ROBINHOOD_MCP_TOKEN` cannot authenticate. Cycles can only
-    run through an already-authenticated client (e.g. Claude Code holding the
-    MCP connection) rather than through `run_agent.py` standalone. The fix — a
-    proper OAuth authorization-code flow with token refresh — is not yet
-    implemented.
+11. **OAuth login is verified end-to-end; token refresh and MCP tool names
+    are not.** Robinhood's Agentic Trading MCP uses OAuth with short-lived
+    tokens issued to a client, so a static bearer token pasted into `.env`
+    as `ROBINHOOD_MCP_TOKEN` cannot authenticate — confirmed, not suspected.
+    The fix, `src/oauth.py`, has now been run for real against Robinhood's
+    live authorization server: `scripts/oauth_login.py` completed a real
+    login, state verification, code exchange, and token storage
+    successfully. What's still unverified: token **refresh** has not been
+    exercised (it requires an actually-expired access token, which this
+    first login doesn't produce), and refresh-token rotation handling
+    (`_refresh_tokens()`'s fallback for a server that omits a new
+    `refresh_token`) is untested against the real endpoint — both are only
+    covered by mocked-HTTP tests in `tests/test_oauth.py`. Separately, every
+    MCP call so far has failed at the auth layer before reaching a tool, so
+    the `READ_ONLY_TOOLS`/`EXECUTION_TOOLS`/`RECONCILE_TOOLS` names in
+    `agent.py` remain unverified against the live server too. Staying in
+    Known Limitations until refresh is exercised for real and at least one
+    MCP tool call succeeds.
 12. **The MCP beta header was wrong for an unknown period, caught only by a
     real API call.** `MCP_BETA_HEADER` was set to `mcp-client-2025-11-25`,
     which the Anthropic API rejects outright with a 400. All 139 tests passed

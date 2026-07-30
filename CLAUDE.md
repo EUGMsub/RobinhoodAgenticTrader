@@ -64,10 +64,13 @@ Each of these fixed a real bug. Reverting reintroduces it.
 - **Confirmed, not suspected:** Robinhood's Agentic Trading MCP uses OAuth
   with short-lived tokens issued to a client. A static bearer token in `.env`
   cannot authenticate, so `run_agent.py`'s direct-token path cannot work as
-  designed. Cycles must run through an already-authenticated client (e.g.
-  Claude Code holding the MCP connection) until a proper OAuth
-  authorization-code flow with token refresh is implemented — that is not yet
-  done.
+  designed. OAuth 2.1 authorization-code + PKCE (`src/oauth.py`) has now been
+  verified end-to-end against the live server — `scripts/oauth_login.py`
+  completed a real login, state verification, code exchange, and token
+  storage. Still unverified: token refresh (no login so far has produced an
+  expired access token to refresh), refresh-token rotation handling, and
+  every MCP tool name in `agent.py` (no call has gotten past auth to reach
+  one yet).
 
 ## Honesty rule
 
