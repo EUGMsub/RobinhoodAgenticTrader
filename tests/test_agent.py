@@ -23,7 +23,13 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agent import _execute_and_reconcile, run_cycle
+from agent import (
+    _execute_and_reconcile,
+    _recompute_snapshot,
+    _session_prices_diverge,
+    _snapshot_diverges_from_model,
+    run_cycle,
+)
 from config import AgentConfig
 from paper_trading import load_paper_portfolio
 
@@ -116,13 +122,48 @@ def _cfg(tmp_path, **overrides):
     return AgentConfig(**defaults)
 
 
+def _snapshot_entry_for(current_price, day_change_pct):
+    """Build raw market_snapshot fields (last_trade_price,
+    adjusted_previous_close, ...) that agent._recompute_snapshot()
+    reproduces exactly this current_price/day_change_pct from — so test
+    fixtures state the number they care about instead of hand-solving the
+    reverse algebra. Extended-hours fields are left null; tests that care
+    about session divergence set them explicitly."""
+    adjusted_previous_close = current_price / (1 + day_change_pct / 100)
+    return {
+        "last_trade_price": current_price,
+        "last_trade_price_timestamp": "2026-01-01T20:00:00Z",
+        "last_non_reg_trade_price": None,
+        "last_non_reg_trade_price_timestamp": None,
+        "adjusted_previous_close": adjusted_previous_close,
+        "day_change_pct": day_change_pct,
+    }
+
+
 def _cycle_report(proposed_orders, market_snapshot=_UNSET):
     payload = {"proposed_orders": proposed_orders}
     if market_snapshot is _UNSET:
-        # Default to a complete snapshot for the single-ticker AAPL
-        # watchlist these tests use, so snapshot handling doesn't
-        # accidentally become the subject of every unrelated test.
-        market_snapshot = {"AAPL": {"current_price": 100.0, "day_change_pct": -5.0}}
+        # Default: derive one raw snapshot entry per distinct ticker
+        # directly from proposed_orders' own current_price/day_change_pct,
+        # so agent.py's code-side recomputation reproduces the exact
+        # number these orders were already written to test against —
+        # existing tests don't have to know recomputation exists. Falls
+        # back to a fixed AAPL entry when there's nothing to derive from
+        # (e.g. proposed_orders is empty).
+        market_snapshot = {}
+        for order in proposed_orders:
+            ticker = order.get("ticker")
+            current_price = order.get("current_price")
+            day_change_pct = order.get("day_change_pct")
+            if (
+                ticker
+                and ticker not in market_snapshot
+                and isinstance(current_price, (int, float))
+                and isinstance(day_change_pct, (int, float))
+            ):
+                market_snapshot[ticker] = _snapshot_entry_for(current_price, day_change_pct)
+        if not market_snapshot:
+            market_snapshot = {"AAPL": _snapshot_entry_for(100.0, -5.0)}
     if market_snapshot is not None:
         payload["market_snapshot"] = market_snapshot
     return f"Here's what I found.\n```json\n{json.dumps(payload)}\n```\n"
@@ -663,7 +704,7 @@ class TestMarketSnapshotLogging:
 
     def test_snapshot_is_logged_on_a_cycle_with_no_proposals(self, tmp_path):
         cfg = _cfg(tmp_path, dry_run=True)
-        snapshot = {"AAPL": {"current_price": 187.42, "day_change_pct": -1.13}}
+        snapshot = {"AAPL": _snapshot_entry_for(187.42, -1.13)}
         client = _FakeClient([_FakeResponse(_cycle_report([], market_snapshot=snapshot))])
 
         run_cycle(cfg, client=client)
@@ -672,14 +713,14 @@ class TestMarketSnapshotLogging:
         snapshots = [e for e in events if e["event"] == "market_snapshot"]
         assert len(snapshots) == 1
         assert snapshots[0]["snapshot"]["AAPL"]["current_price"] == 187.42
-        assert snapshots[0]["snapshot"]["AAPL"]["day_change_pct"] == -1.13
+        assert snapshots[0]["snapshot"]["AAPL"]["day_change_pct"] == pytest.approx(-1.13)
         # A complete snapshot must NOT also raise the incomplete signal.
         assert not any(e["event"] == "market_snapshot_incomplete" for e in events)
 
     def test_missing_ticker_produces_the_incomplete_event(self, tmp_path):
         # Watchlist is AAPL + MSFT; the model only reported AAPL.
         cfg = _cfg(tmp_path, watchlist=("AAPL", "MSFT"), dry_run=True)
-        snapshot = {"AAPL": {"current_price": 187.42, "day_change_pct": -1.13}}
+        snapshot = {"AAPL": _snapshot_entry_for(187.42, -1.13)}
         client = _FakeClient([_FakeResponse(_cycle_report([], market_snapshot=snapshot))])
 
         run_cycle(cfg, client=client)
@@ -805,3 +846,218 @@ class TestApiUsageLogging:
 
         events = _read_log_events(cfg.log_file)
         assert not any(e["event"] == "api_usage" for e in events)
+
+
+class TestRecomputeSnapshotPureLogic:
+    """_recompute_snapshot() is pure — no I/O, no client — so it's tested
+    directly against hand-computed values rather than through a full
+    run_cycle()."""
+
+    def test_regular_session_recomputation_matches_a_hand_computed_value(self, tmp_path):
+        cfg = _cfg(tmp_path)  # price_session defaults to "regular"
+        raw = {
+            "AAPL": {
+                "last_trade_price": 200.0,
+                "last_non_reg_trade_price": None,
+                "adjusted_previous_close": 185.0,
+            }
+        }
+
+        recomputed = _recompute_snapshot(cfg, raw)
+
+        # Hand-computed: (200 - 185) / 185 * 100 = 8.108108108108108...
+        assert recomputed["AAPL"]["current_price"] == 200.0
+        assert recomputed["AAPL"]["day_change_pct"] == pytest.approx(8.108108108108108)
+
+    def test_extended_session_uses_the_extended_price(self, tmp_path):
+        cfg = _cfg(tmp_path, price_session="extended")
+        raw = {
+            "AAPL": {
+                "last_trade_price": 200.0,
+                "last_non_reg_trade_price": 184.0,
+                "adjusted_previous_close": 200.0,
+            }
+        }
+
+        recomputed = _recompute_snapshot(cfg, raw)
+
+        assert recomputed["AAPL"]["current_price"] == 184.0
+        assert recomputed["AAPL"]["day_change_pct"] == pytest.approx(-8.0)
+
+    def test_extended_session_falls_back_to_regular_when_no_extended_trade(self, tmp_path):
+        cfg = _cfg(tmp_path, price_session="extended")
+        raw = {
+            "AAPL": {
+                "last_trade_price": 200.0,
+                "last_non_reg_trade_price": None,
+                "adjusted_previous_close": 185.0,
+            }
+        }
+
+        recomputed = _recompute_snapshot(cfg, raw)
+
+        assert recomputed["AAPL"]["current_price"] == 200.0
+
+    def test_ticker_missing_adjusted_previous_close_is_dropped_not_guessed(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        raw = {"AAPL": {"last_trade_price": 200.0, "last_non_reg_trade_price": None}}
+
+        recomputed = _recompute_snapshot(cfg, raw)
+
+        assert "AAPL" not in recomputed
+
+
+class TestSnapshotDivergenceHelpers:
+    def test_within_tolerance_does_not_diverge(self):
+        entry = {"day_change_pct": 8.0, "model_day_change_pct": 8.03}
+        assert _snapshot_diverges_from_model(entry) is False
+
+    def test_beyond_tolerance_diverges(self):
+        entry = {"day_change_pct": 8.0, "model_day_change_pct": 8.06}
+        assert _snapshot_diverges_from_model(entry) is True
+
+    def test_no_model_value_never_diverges(self):
+        entry = {"day_change_pct": 8.0}
+        assert _snapshot_diverges_from_model(entry) is False
+
+    def test_session_prices_at_the_threshold_do_not_diverge(self):
+        entry = {"last_trade_price": 200.0, "last_non_reg_trade_price": 202.0}  # exactly 1%
+        assert _session_prices_diverge(entry) is False
+
+    def test_session_prices_beyond_the_threshold_diverge(self):
+        entry = {"last_trade_price": 200.0, "last_non_reg_trade_price": 202.5}  # 1.25%
+        assert _session_prices_diverge(entry) is True
+
+    def test_missing_extended_price_never_diverges(self):
+        entry = {"last_trade_price": 200.0, "last_non_reg_trade_price": None}
+        assert _session_prices_diverge(entry) is False
+
+
+class TestRecomputedDayChangeOverridesModel:
+    """The actual false-negative fix: whatever the model puts in an
+    order's day_change_pct is not what guardrails see — the code-recomputed
+    value from the raw quote fields is."""
+
+    def test_model_understating_a_dip_is_corrected_and_approved(self, tmp_path):
+        # The model reports a barely-down order (day_change_pct=-0.5, would
+        # be rejected on its own), but the raw quote fields recompute (for
+        # the default "regular" session) to a real -8% dip. The recomputed
+        # value must win: the order should be APPROVED.
+        cfg = _cfg(tmp_path, dry_run=True)
+        snapshot = {
+            "AAPL": {
+                "last_trade_price": 92.0,
+                "last_trade_price_timestamp": "2026-01-01T20:00:00Z",
+                "last_non_reg_trade_price": None,
+                "last_non_reg_trade_price_timestamp": None,
+                "adjusted_previous_close": 100.0,  # (92-100)/100*100 = -8.0%
+                "day_change_pct": -0.5,  # the model's own, wrong, claim
+            }
+        }
+        order = {
+            "ticker": "AAPL",
+            "side": "buy",
+            "dollars": 25.0,
+            "day_change_pct": -0.5,
+            "current_price": 92.0,
+            "positions": {},
+            "reason": "barely down (model's own, incorrect, claim)",
+        }
+        client = _FakeClient([_FakeResponse(_cycle_report([order], market_snapshot=snapshot))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        fills = [e for e in events if e["event"] == "simulated_fill"]
+        assert len(fills) == 1, "recomputed -8% dip should have cleared the -2% trigger"
+        assert "AAPL down -8.00%" in fills[0]["reason"]
+
+        recompute_events = [e for e in events if e["event"] == "snapshot_recomputed"]
+        assert len(recompute_events) == 1
+        assert recompute_events[0]["model_day_change_pct"] == -0.5
+        assert recompute_events[0]["recomputed_day_change_pct"] == pytest.approx(-8.0)
+
+    def test_model_overclaiming_a_dip_is_corrected_and_rejected(self, tmp_path):
+        # Inverse case: the model claims a qualifying -5% dip, but the raw
+        # fields recompute to only -0.5% — nowhere near the trigger. The
+        # order must be BLOCKED, not approved on the model's say-so.
+        cfg = _cfg(tmp_path, dry_run=True)
+        snapshot = {
+            "AAPL": {
+                "last_trade_price": 99.5,
+                "last_trade_price_timestamp": "2026-01-01T20:00:00Z",
+                "last_non_reg_trade_price": None,
+                "last_non_reg_trade_price_timestamp": None,
+                "adjusted_previous_close": 100.0,  # (99.5-100)/100*100 = -0.5%
+                "day_change_pct": -5.0,  # the model's own, wrong, claim
+            }
+        }
+        order = {
+            "ticker": "AAPL",
+            "side": "buy",
+            "dollars": 25.0,
+            "day_change_pct": -5.0,
+            "current_price": 99.5,
+            "positions": {},
+            "reason": "down 5% (model's own, incorrect, claim)",
+        }
+        client = _FakeClient([_FakeResponse(_cycle_report([order], market_snapshot=snapshot))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        assert any(e["event"] == "order_blocked" for e in events)
+        assert not any(e["event"] == "simulated_fill" for e in events)
+
+    def test_agreeing_model_and_recomputed_values_do_not_log_a_divergence(self, tmp_path):
+        cfg = _cfg(tmp_path, dry_run=True)
+        client = _FakeClient([_FakeResponse(_cycle_report([_approved_buy_order()]))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        assert not any(e["event"] == "snapshot_recomputed" for e in events)
+
+
+class TestSessionDivergenceLogging:
+    def test_session_divergence_event_fires_above_the_threshold(self, tmp_path):
+        cfg = _cfg(tmp_path, dry_run=True)
+        snapshot = {
+            "AAPL": {
+                "last_trade_price": 100.0,
+                "last_trade_price_timestamp": "2026-01-01T20:00:00Z",
+                "last_non_reg_trade_price": 108.0,  # 8% away — well past 1%
+                "last_non_reg_trade_price_timestamp": "2026-01-01T21:30:00Z",
+                "adjusted_previous_close": 100.0,
+                "day_change_pct": 0.0,
+            }
+        }
+        client = _FakeClient([_FakeResponse(_cycle_report([], market_snapshot=snapshot))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        divergences = [e for e in events if e["event"] == "session_divergence"]
+        assert len(divergences) == 1
+        assert divergences[0]["ticker"] == "AAPL"
+        assert divergences[0]["last_trade_price"] == 100.0
+        assert divergences[0]["last_non_reg_trade_price"] == 108.0
+
+    def test_no_session_divergence_event_within_the_threshold(self, tmp_path):
+        cfg = _cfg(tmp_path, dry_run=True)
+        snapshot = {
+            "AAPL": {
+                "last_trade_price": 100.0,
+                "last_trade_price_timestamp": "2026-01-01T20:00:00Z",
+                "last_non_reg_trade_price": 100.5,  # 0.5% away — within threshold
+                "last_non_reg_trade_price_timestamp": "2026-01-01T21:30:00Z",
+                "adjusted_previous_close": 100.0,
+                "day_change_pct": 0.0,
+            }
+        }
+        client = _FakeClient([_FakeResponse(_cycle_report([], market_snapshot=snapshot))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        assert not any(e["event"] == "session_divergence" for e in events)

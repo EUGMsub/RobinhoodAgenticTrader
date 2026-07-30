@@ -31,6 +31,14 @@ class AgentConfig:
     max_total_dollars: float = 10.0
     max_hold_days: int = 10
     disaster_stop_pct: float = 15.0
+    # Which quote field defines "current price" for day_change_pct: the
+    # regular session's last_trade_price, or extended hours'
+    # last_non_reg_trade_price. Must be an explicit, single configured
+    # choice — a false negative on the first live cycle came from the
+    # model silently picking regular-session price and missing an 8%
+    # after-hours move. Defaults to "regular": thin after-hours liquidity
+    # makes extended-hours fills unreliable at $3 order sizes.
+    price_session: str = "regular"
     correlation_groups: Mapping[str, tuple[str, ...]] = field(
         default_factory=lambda: DEFAULT_CORRELATION_GROUPS
     )

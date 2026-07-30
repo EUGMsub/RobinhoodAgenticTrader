@@ -23,6 +23,14 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 
+# The model's reports routinely contain characters (≤, →, —, ❌, …) that
+# Windows' default console encoding (cp1252) can't represent. Without
+# this, print(report) crashes AFTER a cycle has already run and logged
+# successfully — a confusing failure that looks like the cycle itself
+# broke. UTF-8 with errors="replace" means the worst case is a stray "?"
+# in the terminal, never a crash.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from agent import run_cycle
 from config import AgentConfig
 

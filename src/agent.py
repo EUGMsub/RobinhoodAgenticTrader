@@ -154,18 +154,144 @@ def _parse_market_snapshot(text: str) -> dict | None:
     return snapshot if isinstance(snapshot, dict) else None
 
 
-def _log_market_snapshot(cfg: AgentConfig, text: str) -> None:
-    """Log what the model actually saw this cycle, every cycle.
+# A model-reported day_change_pct within this many percentage points of
+# the code-recomputed value is treated as ordinary rounding noise, not a
+# disagreement worth flagging.
+SNAPSHOT_RECOMPUTE_TOLERANCE_PCT = 0.05
+
+# Regular- and extended-hours prices this far apart (as a % of the regular
+# price) is a signal that the configured price_session might be hiding a
+# large move happening in the other session.
+SESSION_DIVERGENCE_THRESHOLD_PCT = 1.0
+
+
+def _select_session_price(cfg: AgentConfig, raw: dict) -> float | None:
+    """Return the price for cfg.price_session from one ticker's raw quote
+    fields, or None if that session's field is missing/non-numeric.
+
+    "extended" falls back to the regular-session price when no
+    extended-hours trade has happened yet today — there's no "no price"
+    state to compute a percent change from.
+    """
+    last_trade = raw.get("last_trade_price")
+    last_non_reg = raw.get("last_non_reg_trade_price")
+
+    if cfg.price_session == "extended":
+        if isinstance(last_non_reg, (int, float)):
+            return float(last_non_reg)
+        if isinstance(last_trade, (int, float)):
+            return float(last_trade)
+        return None
+
+    if isinstance(last_trade, (int, float)):
+        return float(last_trade)
+    return None
+
+
+def _compute_day_change_pct(price: float, adjusted_previous_close: float) -> float | None:
+    if adjusted_previous_close <= 0:
+        return None
+    return (price - adjusted_previous_close) / adjusted_previous_close * 100
+
+
+def _recompute_snapshot(cfg: AgentConfig, raw_snapshot: dict) -> dict[str, dict]:
+    """Recompute current_price/day_change_pct per ticker in code from the
+    model-reported raw quote fields, for the configured price_session.
+
+    Pure — no I/O, never trusts the model's own arithmetic for the
+    numbers that will actually gate a trade. A ticker whose raw fields are
+    missing or incomplete is simply absent from the result rather than
+    guessed at, so it surfaces as "missing" the same way an omitted
+    ticker does.
+    """
+    recomputed: dict[str, dict] = {}
+    for ticker, raw in raw_snapshot.items():
+        if not isinstance(raw, dict):
+            continue
+        key = str(ticker).upper().strip()
+
+        price = _select_session_price(cfg, raw)
+        prev_close = raw.get("adjusted_previous_close")
+        if price is None or not isinstance(prev_close, (int, float)):
+            continue
+
+        day_change_pct = _compute_day_change_pct(price, float(prev_close))
+        if day_change_pct is None:
+            continue
+
+        entry = {
+            "current_price": price,
+            "day_change_pct": day_change_pct,
+            "last_trade_price": raw.get("last_trade_price"),
+            "last_non_reg_trade_price": raw.get("last_non_reg_trade_price"),
+            "adjusted_previous_close": float(prev_close),
+        }
+        model_day_change_pct = raw.get("day_change_pct")
+        if isinstance(model_day_change_pct, (int, float)):
+            entry["model_day_change_pct"] = float(model_day_change_pct)
+
+        recomputed[key] = entry
+
+    return recomputed
+
+
+def _snapshot_diverges_from_model(entry: dict) -> bool:
+    """True if the model's own reported day_change_pct disagrees with the
+    code-recomputed value by more than SNAPSHOT_RECOMPUTE_TOLERANCE_PCT."""
+    model_val = entry.get("model_day_change_pct")
+    if model_val is None:
+        return False
+    return abs(model_val - entry["day_change_pct"]) > SNAPSHOT_RECOMPUTE_TOLERANCE_PCT
+
+
+def _session_prices_diverge(entry: dict) -> bool:
+    """True if regular- and extended-hours prices differ by more than
+    SESSION_DIVERGENCE_THRESHOLD_PCT of the regular price — a signal the
+    configured session may be hiding a large move in the other one."""
+    regular = entry.get("last_trade_price")
+    extended = entry.get("last_non_reg_trade_price")
+    if not isinstance(regular, (int, float)) or not isinstance(extended, (int, float)):
+        return False
+    if regular == 0:
+        return False
+    return abs(extended - regular) / abs(regular) * 100 > SESSION_DIVERGENCE_THRESHOLD_PCT
+
+
+def _apply_recomputed_day_change_pct(orders: list[dict], recomputed: dict[str, dict]) -> None:
+    """Overwrite each buy order's day_change_pct in place with the
+    code-recomputed value for its ticker, when available. This is what
+    makes the recomputation actually bind: validate_batch() reads
+    day_change_pct straight off the order dict, so whatever value sits
+    here at that point is the one guardrails see — never the model's.
+    """
+    for order in orders:
+        if order.get("side") != "buy":
+            continue
+        ticker = str(order.get("ticker", "")).upper().strip()
+        entry = recomputed.get(ticker)
+        if entry is not None:
+            order["day_change_pct"] = entry["day_change_pct"]
+
+
+def _log_market_snapshot(cfg: AgentConfig, text: str) -> dict[str, dict]:
+    """Log what the model actually saw this cycle, every cycle, and
+    recompute current_price/day_change_pct in code from the raw quote
+    fields the model reports — the model's own arithmetic is logged
+    alongside for comparison, but never used for a trading decision.
 
     Without this, a no-trade day is indistinguishable from a broken tool
     call: both produce zero orders. Logging the snapshot unconditionally
     means "fetched real prices, nothing qualified" leaves evidence, and a
     missing or partial snapshot raises a loud, specific signal instead of
     looking like a quiet, uneventful day.
-    """
-    snapshot = _parse_market_snapshot(text)
 
-    if snapshot is None:
+    Returns the recomputed per-ticker snapshot ({} if nothing could be
+    recomputed) so the caller can apply it to proposed orders before
+    guardrail validation.
+    """
+    raw_snapshot = _parse_market_snapshot(text)
+
+    if raw_snapshot is None:
         print(
             "\n*** WARNING: no market_snapshot in this cycle's response — "
             "cannot confirm the agent actually fetched market data. Treat "
@@ -178,25 +304,61 @@ def _log_market_snapshot(cfg: AgentConfig, text: str) -> None:
             missing_tickers=list(cfg.watchlist),
             reason="no market_snapshot object in the model's response",
         )
-        return
+        return {}
 
-    normalized = {str(t).upper().strip(): v for t, v in snapshot.items()}
-    missing = [t for t in cfg.watchlist if t.upper().strip() not in normalized]
+    normalized_raw = {str(t).upper().strip(): v for t, v in raw_snapshot.items()}
+    recomputed = _recompute_snapshot(cfg, normalized_raw)
+    missing = [t for t in cfg.watchlist if t.upper().strip() not in recomputed]
 
-    log_event(cfg.log_file, "market_snapshot", snapshot=normalized)
+    log_event(cfg.log_file, "market_snapshot", snapshot=recomputed)
 
     if missing:
         print(
-            f"\n*** WARNING: market_snapshot is missing {', '.join(missing)} "
-            "— the agent may not have successfully fetched quotes for "
-            "every watchlist ticker this cycle. ***"
+            f"\n*** WARNING: market_snapshot is missing or unrecomputable for "
+            f"{', '.join(missing)} — the agent may not have successfully "
+            "fetched quotes, or didn't report enough raw fields to "
+            "independently recompute the day change, for every watchlist "
+            "ticker this cycle. ***"
         )
         log_event(
             cfg.log_file,
             "market_snapshot_incomplete",
             missing_tickers=missing,
-            reason="watchlist tickers absent from the model's market_snapshot",
+            reason=(
+                "watchlist ticker absent from the model's market_snapshot, "
+                "or missing the raw fields needed to recompute day_change_pct"
+            ),
         )
+
+    for ticker, entry in recomputed.items():
+        if _snapshot_diverges_from_model(entry):
+            print(
+                f"\n*** WARNING: {ticker} day_change_pct disagreement — "
+                f"model said {entry.get('model_day_change_pct'):+.2f}%, "
+                f"recomputed from raw fields is {entry['day_change_pct']:+.2f}%. "
+                "Using the recomputed value. ***"
+            )
+            log_event(
+                cfg.log_file,
+                "snapshot_recomputed",
+                ticker=ticker,
+                model_day_change_pct=entry.get("model_day_change_pct"),
+                recomputed_day_change_pct=entry["day_change_pct"],
+                price_session=cfg.price_session,
+                current_price=entry["current_price"],
+                adjusted_previous_close=entry["adjusted_previous_close"],
+            )
+        if _session_prices_diverge(entry):
+            log_event(
+                cfg.log_file,
+                "session_divergence",
+                ticker=ticker,
+                last_trade_price=entry.get("last_trade_price"),
+                last_non_reg_trade_price=entry.get("last_non_reg_trade_price"),
+                configured_session=cfg.price_session,
+            )
+
+    return recomputed
 
 
 def _log_api_usage(cfg: AgentConfig, call: str, response) -> None:
@@ -498,9 +660,16 @@ def run_cycle(cfg: AgentConfig, client: anthropic.Anthropic | None = None) -> st
 
     # Log what the model saw BEFORE any validation or early return, so a
     # zero-order cycle still leaves proof that data was actually fetched.
-    _log_market_snapshot(cfg, text)
+    # Also recomputes day_change_pct in code from the raw quote fields —
+    # never the model's own arithmetic.
+    recomputed_snapshot = _log_market_snapshot(cfg, text)
 
     proposed = _parse_proposed_orders(text)
+    # Every buy order's day_change_pct is overwritten here with the
+    # code-recomputed value for its ticker before it ever reaches
+    # validate_batch() — this is the actual fix for the missed after-hours
+    # move: whatever the model put in the order is not what guardrails see.
+    _apply_recomputed_day_change_pct(proposed, recomputed_snapshot)
     if not proposed:
         return text
 

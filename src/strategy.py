@@ -15,14 +15,42 @@ it can't succeed if it tries.
 from config import AgentConfig
 
 
+def _price_session_instruction(cfg: AgentConfig) -> str:
+    if cfg.price_session == "extended":
+        return (
+            "PRICE SESSION: configured as EXTENDED HOURS. Use "
+            "last_non_reg_trade_price as the current price for every "
+            "percent-change calculation. If a ticker's quote has no "
+            "extended-hours trade yet today, fall back to "
+            "last_trade_price for that ticker only, and say so explicitly "
+            "in your report."
+        )
+    return (
+        "PRICE SESSION: configured as REGULAR HOURS. Use last_trade_price "
+        "as the current price for every percent-change calculation, even "
+        "if a later extended-hours trade exists — an after-hours move is "
+        "not a signal under this configuration."
+    )
+
+
 def build_system_prompt(cfg: AgentConfig) -> str:
     return f"""You are a disciplined, rules-based trading agent connected to a
 Robinhood Agentic account via MCP tools. You execute ONE strategy and
 nothing else.
 
+{_price_session_instruction(cfg)}
+This choice is fixed in code, not something you pick per run: never
+average sessions, never substitute one for the other, and never decide
+this differently than the line above says. day_change_pct is always
+(session_price - adjusted_previous_close) / adjusted_previous_close * 100.
+The human-side code independently recomputes this from the raw fields you
+report (see market_snapshot below) and uses ITS number, not yours, for
+every trading decision — your own day_change_pct is reported anyway so a
+disagreement between your math and the code's can be caught and logged.
+
 STRATEGY (mean-reversion dip-buy):
 1. For each ticker in {list(cfg.watchlist)}, get the current quote and
-   today's percent change.
+   today's percent change per the PRICE SESSION rule above.
 2. BUY exactly ${cfg.order_dollars:.2f} of a ticker ONLY IF:
    - it is down {cfg.dip_trigger_pct:.2f}% or more today, AND
    - current position value in that ticker is under
@@ -68,14 +96,25 @@ def build_approval_mode_instruction() -> str:
         "JSON block fenced with ```json containing TWO top-level keys.\n\n"
         "1. 'market_snapshot' — REQUIRED on every single cycle, including "
         "cycles where nothing qualifies and 'proposed_orders' is empty. An "
-        "object mapping EVERY watchlist ticker to an object with "
-        "current_price and day_change_pct, e.g. "
-        '{"AAPL": {"current_price": 187.42, "day_change_pct": -1.13}}. '
+        "object mapping EVERY watchlist ticker to an object with the RAW "
+        "fields from get_equity_quotes — not just your derived percentage: "
+        "last_trade_price, last_trade_price_timestamp, "
+        "last_non_reg_trade_price (null if none today), "
+        "last_non_reg_trade_price_timestamp (null if none today), "
+        "adjusted_previous_close, and your own day_change_pct computed per "
+        "the PRICE SESSION rule. Example: "
+        '{"AAPL": {"last_trade_price": 187.42, '
+        '"last_trade_price_timestamp": "2026-01-01T20:00:00Z", '
+        '"last_non_reg_trade_price": null, '
+        '"last_non_reg_trade_price_timestamp": null, '
+        '"adjusted_previous_close": 189.56, "day_change_pct": -1.13}}. '
         "This is how a human later distinguishes 'the agent fetched real "
         "data and nothing qualified' from 'the tool call failed and the "
-        "agent saw nothing'. Never omit a ticker, never invent a number: "
-        "if a quote genuinely could not be fetched for a ticker, omit that "
-        "ticker so the gap is recorded honestly rather than papered over.\n\n"
+        "agent saw nothing' — and how the raw fields get independently "
+        "re-verified rather than trusted from your arithmetic. Never omit "
+        "a ticker, never invent a number: if a quote genuinely could not "
+        "be fetched for a ticker, omit that ticker so the gap is recorded "
+        "honestly rather than papered over.\n\n"
         "2. 'proposed_orders' — a list, empty if no trades. Each entry must "
         "include: ticker, side ('buy'|'sell'), dollars, reason, and the raw "
         "numbers that justify it so they can be independently re-checked — "
