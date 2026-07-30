@@ -24,14 +24,18 @@ its arithmetic, or its report of what it did.
 
 ## Status
 
-- ✅ Guardrail layer: 67 unit tests passing (`pytest tests/ -v`), no
-  credentials required to verify.
+- ✅ 183 unit tests (`pytest tests/ -v`) — 182 passing, one POSIX-only file
+  permission check skipped on Windows. No credentials required to verify.
 - ✅ Backtested against ~2 years of real daily bars. Results below.
 - ✅ Agent orchestration, MCP wiring, batch validation, instrument-type
   enforcement, post-execution reconciliation, CLI approval flow.
-- ⏳ **Not yet run against a funded live account.** The Agentic account exists
-  but is unfunded. The guardrail and backtest layers were built and validated
-  first, deliberately, before putting real money behind it.
+- ✅ **Ran against the funded live account for the first time on 2026-07-30.**
+  OAuth login succeeded end-to-end; real quotes were fetched via MCP for
+  every watchlist ticker; zero orders were proposed, correctly — nothing met
+  the dip trigger that day. No order has ever been placed: every live call so
+  far has been either auth-only (login) or read-only (`--dry-run` proposal
+  cycles). See Known Limitations #11–13 for exactly what today's run verified
+  versus what's still untested.
 
 ## Backtest results
 
@@ -81,8 +85,14 @@ days that trade (execution, then reconciliation). Across ~500 trading days,
 of magnitude as the returns. **At small account sizes, an LLM-driven trading
 agent can cost roughly as much to operate as it earns.**
 
-Measuring this precisely against a live run is the most interesting open
-question in this project.
+**First real measurement (2026-07-30):** two live proposal-only cycles (no
+order qualified either time, so no execution/reconciliation calls) cost
+$0.0549 and $0.0616 — about 5.5–6.2 cents each. Two data points, not an
+average, and execution/reconciliation cost on a trade day remains
+unmeasured. But at ~6 cents/day, ~500 trading days of proposal calls alone
+would run roughly $27–31 — squarely in the same order of magnitude as the
+backtest's entire $32.24 two-year profit, confirming the concern above
+wasn't theoretical.
 
 ### On the 72.7% win rate
 
@@ -187,24 +197,27 @@ Stated plainly because they're real, and because a reviewer will find them.
 10. **The effective account cap is $200, not $400.** With every watchlist
     ticker in one correlation group and `max_group_dollars = 200`,
     `max_total_dollars = 400` can never bind.
-11. **OAuth login is verified end-to-end; token refresh and MCP tool names
-    are not.** Robinhood's Agentic Trading MCP uses OAuth with short-lived
+11. **OAuth login and MCP tool calls are verified end-to-end; token refresh
+    is not.** Robinhood's Agentic Trading MCP uses OAuth with short-lived
     tokens issued to a client, so a static bearer token pasted into `.env`
     as `ROBINHOOD_MCP_TOKEN` cannot authenticate — confirmed, not suspected.
     The fix, `src/oauth.py`, has now been run for real against Robinhood's
     live authorization server: `scripts/oauth_login.py` completed a real
     login, state verification, code exchange, and token storage
-    successfully. What's still unverified: token **refresh** has not been
-    exercised (it requires an actually-expired access token, which this
-    first login doesn't produce), and refresh-token rotation handling
+    successfully — and the resulting access token authenticated real MCP
+    calls: `get_equity_quotes`, `get_accounts`, and `get_equity_positions`
+    all worked against the live server, fetching real watchlist quotes and
+    confirming the agentic account (`602437931`) had zero open positions.
+    The `READ_ONLY_TOOLS` allowlist in `agent.py` is verified;
+    `EXECUTION_TOOLS`/`RECONCILE_TOOLS` are not, since no order has ever
+    qualified for approval. What's still unverified: token **refresh** has
+    not been exercised (it requires an actually-expired access token, which
+    no login so far has produced), and refresh-token rotation handling
     (`_refresh_tokens()`'s fallback for a server that omits a new
     `refresh_token`) is untested against the real endpoint — both are only
-    covered by mocked-HTTP tests in `tests/test_oauth.py`. Separately, every
-    MCP call so far has failed at the auth layer before reaching a tool, so
-    the `READ_ONLY_TOOLS`/`EXECUTION_TOOLS`/`RECONCILE_TOOLS` names in
-    `agent.py` remain unverified against the live server too. Staying in
-    Known Limitations until refresh is exercised for real and at least one
-    MCP tool call succeeds.
+    covered by mocked-HTTP tests in `tests/test_oauth.py`. Staying in Known
+    Limitations until refresh is exercised for real and an order is actually
+    placed and reconciled.
 12. **The MCP beta header was wrong for an unknown period, caught only by a
     real API call.** `MCP_BETA_HEADER` was set to `mcp-client-2025-11-25`,
     which the Anthropic API rejects outright with a 400. All 139 tests passed
@@ -213,6 +226,26 @@ Stated plainly because they're real, and because a reviewer will find them.
     documented `mcp-client-2025-11-20`. A note on the limits of mocked
     testing: a wrong constant that's never exercised against the real API can
     sit behind full test coverage indefinitely.
+13. **A false negative found on the first live cycle: the model silently
+    picked regular-session price, missing an 8% after-hours move.** AAPL's
+    regular-session close was roughly flat, but a later after-hours trade
+    was down ~8% — a real dip that would have qualified for a buy under the
+    extended session, not the regular one. The model's `day_change_pct` was
+    arithmetically correct for the price field it picked; it simply picked
+    which session to trade on, silently, on its own, each run. Fixed by
+    making `price_session` an explicit `AgentConfig` value (`"regular"` by
+    default), recomputing `day_change_pct` in code from the raw
+    `last_trade_price` / `last_non_reg_trade_price` / `adjusted_previous_close`
+    fields rather than trusting the model's arithmetic, and logging
+    `session_divergence` whenever the two sessions disagree by more than 1%
+    — confirmed working on a subsequent live cycle the same day, where it
+    correctly fired for AAPL's ~6.2% regular/extended price gap. Read this
+    precisely: the default (`"regular"`) still ignores
+    after-hours moves **by design** — a dip that only shows up after hours
+    will not trigger a buy unless `price_session="extended"`. What changed
+    is that this choice is now explicit, deterministic, and logged every
+    time it matters, instead of being made silently by the model on a
+    per-run basis.
 
 ## Setup
 
@@ -220,7 +253,7 @@ Stated plainly because they're real, and because a reviewer will find them.
 git clone https://github.com/EUGMsub/RobinhoodAgenticTrader.git
 cd RobinhoodAgenticTrader
 pip install -r requirements.txt
-pytest tests/ -v          # 67 tests, no credentials needed
+pytest tests/ -v          # 183 tests (182 pass, 1 skipped on Windows), no credentials needed
 ```
 
 Reproduce the backtest (no credentials, no funded account):
@@ -252,11 +285,13 @@ src/
   guardrails.py     pure, unit-tested hard limits + batch validation
   reconcile.py      pure post-execution order verification
   agent.py          orchestration: MCP calls, validation, approval, execution
+  oauth.py          OAuth 2.1 authorization-code + PKCE client for the MCP server
   backtest.py       pure replay engine - reuses guardrails unchanged
   logging_utils.py  append-only structured audit log
-tests/              67 tests, zero network calls
+tests/              183 tests (182 pass, 1 skipped on Windows), zero network calls
 scripts/
   run_agent.py        live agent entry point
+  oauth_login.py      one-time interactive OAuth login
   load_bars_local.py  credential-free bar loader (yfinance)
   fetch_bars.py       bar loader via Robinhood MCP
   run_backtest.py     backtest runner + benchmark report

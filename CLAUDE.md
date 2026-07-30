@@ -55,22 +55,40 @@ Each of these fixed a real bug. Reverting reintroduces it.
 
 ## Current state
 
-- 137 tests passing
+- 183 tests (182 passing, 1 POSIX-only permission check skipped on Windows)
 - Backtest done: strategy +8.06% vs VOO +38.67% over ~2yr. Underperforms; this
   is disclosed in the README, not hidden.
-- **Never run live.** No real API cycle has executed.
 - Agentic account funded with $10. `order_dollars` must be ≤ ~$3 or orders will
   be rejected for insufficient funds.
-- **Confirmed, not suspected:** Robinhood's Agentic Trading MCP uses OAuth
-  with short-lived tokens issued to a client. A static bearer token in `.env`
-  cannot authenticate, so `run_agent.py`'s direct-token path cannot work as
-  designed. OAuth 2.1 authorization-code + PKCE (`src/oauth.py`) has now been
-  verified end-to-end against the live server — `scripts/oauth_login.py`
-  completed a real login, state verification, code exchange, and token
-  storage. Still unverified: token refresh (no login so far has produced an
-  expired access token to refresh), refresh-token rotation handling, and
-  every MCP tool name in `agent.py` (no call has gotten past auth to reach
-  one yet).
+- **First live run: 2026-07-30.** Real API calls made for the first time in
+  this project's history. No order has ever been placed — every live call so
+  far has been auth-only (login) or read-only (`--dry-run` proposal cycles).
+  What today verified, precisely:
+  - **OAuth (README #11):** `src/oauth.py`'s authorization-code + PKCE flow
+    verified end-to-end against the live server — `scripts/oauth_login.py`
+    completed a real login, state verification, code exchange, token storage.
+    Still unverified: token refresh (no login so far has produced an expired
+    access token) and refresh-token rotation handling.
+  - **MCP tool calls (README #11):** `get_equity_quotes`, `get_accounts`, and
+    `get_equity_positions` all worked against the live server — real quotes
+    fetched, agentic account (`602437931`) confirmed with 0 positions.
+    `EXECUTION_TOOLS`/`RECONCILE_TOOLS` remain unverified; no order has ever
+    qualified for approval.
+  - **MCP beta header (README #12):** resolved. `MCP_BETA_HEADER` was wrong
+    (`mcp-client-2025-11-25`) for an unknown period; invisible to all 139
+    tests passing at the time because every test uses a fake client. Caught
+    only by the first real API call. Fixed to `mcp-client-2025-11-20`.
+  - **Session-price false negative (README #13), NEW:** the model silently
+    used regular-session price and missed a real ~8% after-hours move on
+    AAPL. Fixed by making `price_session` an explicit `AgentConfig` value
+    (`"regular"` by default), recomputing `day_change_pct` in code from raw
+    quote fields instead of trusting the model's arithmetic, and logging
+    `session_divergence` on >1% regular/extended disagreement — confirmed
+    firing for real (AAPL, ~6.2% gap) on a later cycle the same day. The
+    default still ignores after-hours moves by design; what changed is that
+    the choice is explicit and logged, not silently made by the model.
+  - Two real proposal cycles cost $0.0549 and $0.0616 — see README "Cost per
+    trade" for what that implies at scale.
 
 ## Honesty rule
 
