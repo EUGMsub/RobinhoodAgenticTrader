@@ -22,3 +22,8 @@ trades.csv
 data/
 
 .DS_Store
+
+# OAuth tokens — brokerage account credentials, never commit
+.oauth_tokens.json
+*.token.json
+tokens/
