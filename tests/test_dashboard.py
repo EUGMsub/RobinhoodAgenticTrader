@@ -41,7 +41,7 @@ def _cfg(**overrides):
         order_dollars=25.0,
         anthropic_api_key="k",
         mcp_url="u",
-        mcp_token="t",
+        robinhood_client_id="c",
         agentic_account_number="1",
     )
     defaults.update(overrides)

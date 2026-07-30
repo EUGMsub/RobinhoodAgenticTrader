@@ -69,7 +69,13 @@ class AgentConfig:
     # --- credentials (populated from environment, never hardcoded) ---
     anthropic_api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
     mcp_url: str = field(default_factory=lambda: os.environ.get("ROBINHOOD_MCP_URL", ""))
-    mcp_token: str = field(default_factory=lambda: os.environ.get("ROBINHOOD_MCP_TOKEN", ""))
+    # No static token field: Robinhood's Agentic Trading MCP uses OAuth
+    # (see src/oauth.py) — the per-call bearer value is minted at request
+    # time by oauth.get_valid_access_token(robinhood_client_id), never
+    # read from a fixed env var the way mcp_url/agentic_account_number are.
+    robinhood_client_id: str = field(
+        default_factory=lambda: os.environ.get("ROBINHOOD_CLIENT_ID", "")
+    )
     agentic_account_number: str = field(
         default_factory=lambda: os.environ.get("ROBINHOOD_ACCOUNT_NUMBER", "")
     )
@@ -94,7 +100,7 @@ class AgentConfig:
             for name, val in [
                 ("ANTHROPIC_API_KEY", self.anthropic_api_key),
                 ("ROBINHOOD_MCP_URL", self.mcp_url),
-                ("ROBINHOOD_MCP_TOKEN", self.mcp_token),
+                ("ROBINHOOD_CLIENT_ID", self.robinhood_client_id),
                 ("ROBINHOOD_ACCOUNT_NUMBER", self.agentic_account_number),
             ]
             if not val

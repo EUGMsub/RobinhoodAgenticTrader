@@ -28,8 +28,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import anthropic
 
 from config import AgentConfig
+from oauth import get_valid_access_token
 
-MCP_BETA_HEADER = "mcp-client-2025-11-25"
+# Verified against platform.claude.com/docs/en/agents-and-tools/mcp-connector
+# on 2026-07-30 — matches the same constant in src/agent.py; kept as a
+# separate copy here since this script imports neither agent.py nor its
+# MCP_BETA_HEADER.
+MCP_BETA_HEADER = "mcp-client-2025-11-20"
 DEFAULT_OUT_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "bars.json")
 
 
@@ -39,7 +44,7 @@ def _mcp_server_block(cfg: AgentConfig) -> list[dict]:
             "type": "url",
             "url": cfg.mcp_url,
             "name": "robinhood-trading",
-            "authorization_token": cfg.mcp_token,
+            "authorization_token": get_valid_access_token(cfg.robinhood_client_id),
         }
     ]
 
@@ -107,7 +112,7 @@ def main() -> None:
         for name, val in [
             ("ANTHROPIC_API_KEY", cfg.anthropic_api_key),
             ("ROBINHOOD_MCP_URL", cfg.mcp_url),
-            ("ROBINHOOD_MCP_TOKEN", cfg.mcp_token),
+            ("ROBINHOOD_CLIENT_ID", cfg.robinhood_client_id),
         ]
         if not val
     ]

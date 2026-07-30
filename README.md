@@ -224,7 +224,8 @@ Run the live agent (requires credentials — see `.env.example`):
 
 ```bash
 cp .env.example .env      # fill in ANTHROPIC_API_KEY, ROBINHOOD_MCP_URL,
-                          # ROBINHOOD_MCP_TOKEN, ROBINHOOD_ACCOUNT_NUMBER
+                          # ROBINHOOD_ACCOUNT_NUMBER, ROBINHOOD_CLIENT_ID
+python scripts/oauth_login.py   # one-time OAuth login (see Known Limitations #11)
 python scripts/run_agent.py
 ```
 

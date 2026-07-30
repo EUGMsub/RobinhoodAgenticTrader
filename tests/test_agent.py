@@ -31,6 +31,18 @@ from paper_trading import load_paper_portfolio
 _UNSET = object()
 
 
+@pytest.fixture(autouse=True)
+def _fake_access_token(monkeypatch):
+    """Every test in this file goes through agent._mcp_server_block(),
+    which now calls oauth.get_valid_access_token() instead of reading a
+    static config field. None of these tests are about OAuth — stub it out
+    globally so they stay hermetic (no real token file, no network) and
+    keep asserting what they were already asserting."""
+    import agent as agent_module
+
+    monkeypatch.setattr(agent_module, "get_valid_access_token", lambda client_id: "fake-access-token")
+
+
 class _FakeBlock:
     def __init__(self, text):
         self.type = "text"
@@ -97,7 +109,7 @@ def _cfg(tmp_path, **overrides):
         paper_portfolio_file=str(tmp_path / "paper_portfolio.json"),
         anthropic_api_key="test-key",
         mcp_url="https://example.invalid/mcp",
-        mcp_token="test-token",
+        robinhood_client_id="test-client-id",
         agentic_account_number="123456789",
     )
     defaults.update(overrides)

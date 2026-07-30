@@ -51,6 +51,7 @@ import anthropic
 from config import AgentConfig
 from guardrails import validate_batch
 from logging_utils import log_event
+from oauth import get_valid_access_token
 from paper_trading import (
     apply_simulated_buy,
     apply_simulated_sell,
@@ -95,7 +96,10 @@ def _mcp_server_block(cfg: AgentConfig) -> list[dict]:
             "type": "url",
             "url": cfg.mcp_url,
             "name": MCP_SERVER_NAME,
-            "authorization_token": cfg.mcp_token,
+            # Minted per call, not read from a fixed config field — a
+            # static bearer token cannot authenticate against this server
+            # (see README "Known Limitations" #11 and src/oauth.py).
+            "authorization_token": get_valid_access_token(cfg.robinhood_client_id),
         }
     ]
 
