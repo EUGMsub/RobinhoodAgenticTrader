@@ -61,9 +61,13 @@ Each of these fixed a real bug. Reverting reintroduces it.
 - **Never run live.** No real API cycle has executed.
 - Agentic account funded with $10. `order_dollars` must be ≤ ~$3 or orders will
   be rejected for insufficient funds.
-- Robinhood's OAuth flow appears not to expose a paste-able bearer token, so
-  `run_agent.py`'s direct-token path may not authenticate. Fallback is running
-  cycles through Claude Code, which holds the connection.
+- **Confirmed, not suspected:** Robinhood's Agentic Trading MCP uses OAuth
+  with short-lived tokens issued to a client. A static bearer token in `.env`
+  cannot authenticate, so `run_agent.py`'s direct-token path cannot work as
+  designed. Cycles must run through an already-authenticated client (e.g.
+  Claude Code holding the MCP connection) until a proper OAuth
+  authorization-code flow with token refresh is implemented — that is not yet
+  done.
 
 ## Honesty rule
 

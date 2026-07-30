@@ -187,6 +187,14 @@ Stated plainly because they're real, and because a reviewer will find them.
 10. **The effective account cap is $200, not $400.** With every watchlist
     ticker in one correlation group and `max_group_dollars = 200`,
     `max_total_dollars = 400` can never bind.
+11. **`run_agent.py`'s static-token auth cannot work as designed — confirmed,
+    not suspected.** Robinhood's Agentic Trading MCP uses OAuth with
+    short-lived tokens issued to a client, so a static bearer token pasted
+    into `.env` as `ROBINHOOD_MCP_TOKEN` cannot authenticate. Cycles can only
+    run through an already-authenticated client (e.g. Claude Code holding the
+    MCP connection) rather than through `run_agent.py` standalone. The fix — a
+    proper OAuth authorization-code flow with token refresh — is not yet
+    implemented.
 
 ## Setup
 
