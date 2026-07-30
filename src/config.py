@@ -19,19 +19,19 @@ class AgentConfig:
     watchlist: tuple[str, ...] = ("VOO", "AAPL", "MSFT")
     dip_trigger_pct: float = 2.0
     revert_target_pct: float = 3.0
-    order_dollars: float = 25.0
-    max_position_dollars: float = 150.0
-    max_total_dollars: float = 400.0
+    order_dollars: float = 3.0
+    max_position_dollars: float = 6.0
+    max_total_dollars: float = 10.0
     max_hold_days: int = 10
     disaster_stop_pct: float = 15.0
     correlation_groups: Mapping[str, tuple[str, ...]] = field(
         default_factory=lambda: DEFAULT_CORRELATION_GROUPS
     )
-    max_group_dollars: float = 200.0
+    max_group_dollars: float = 8.0
 
     # --- backtest-only parameters (not part of live guardrails) ---
     slippage_pct: float = 0.05
-    initial_cash: float = 400.0
+    initial_cash: float = 10.0
 
     # --- operational parameters ---
     approval_mode: bool = True

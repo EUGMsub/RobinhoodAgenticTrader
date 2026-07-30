@@ -35,6 +35,11 @@ its arithmetic, or its report of what it did.
 
 ## Backtest results
 
+This backtest was run under the previous configuration ($400 starting cash,
+$25 orders, $150 per-position cap, $200 group cap). `src/config.py` now ships
+smaller defaults sized for a $10 funded live account; the figures below are
+historical and accurate as reported for the configuration they were run under.
+
 Period: 2024-07-29 → 2026-07-27. Starting cash $400. Slippage 0.05% per side.
 Signals computed on each bar's close, filled at the **next** bar's open — never
 same-bar, to avoid lookahead.

@@ -12,6 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from config import AgentConfig
 from guardrails import (
     GuardrailConfig,
     validate_batch,
@@ -348,3 +349,30 @@ class TestValidateBatch:
         order, result = batch[0]
         assert not result.approved
         assert "unrecognized side" in result.reason
+
+
+class TestShippedDefaultsAreConsistent:
+    """
+    No other test exercises AgentConfig()'s actual defaults — every test above
+    passes explicit values instead. A typo in the shipped numbers (e.g. a cap
+    ordering inversion) would sail through the whole suite undetected without
+    this.
+    """
+
+    def test_dollar_caps_are_ordered_and_positive(self):
+        cfg = AgentConfig()
+
+        assert 0 < cfg.order_dollars <= cfg.max_position_dollars
+        assert cfg.max_position_dollars <= cfg.max_group_dollars
+        assert cfg.max_group_dollars <= cfg.max_total_dollars
+
+    def test_every_watchlist_ticker_is_in_a_correlation_group(self):
+        cfg = AgentConfig()
+        grouped_tickers = {
+            ticker
+            for group in cfg.correlation_groups.values()
+            for ticker in group
+        }
+
+        for ticker in cfg.watchlist:
+            assert ticker in grouped_tickers
