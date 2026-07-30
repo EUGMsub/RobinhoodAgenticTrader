@@ -180,6 +180,12 @@ separately:
   would report on renders nothing — absence of data is not a passing
   check.
 
+![Dashboard from a live cycle: the session divergence panel firing for AAPL's 6.19% regular/extended gap](images/dashboard.png)
+
+This is a real cycle from 2026-07-30, not a mockup — the divergence panel
+is the instrumentation above actually catching a real after-hours move
+that the configured session correctly ignored.
+
 ## The trust boundary
 
 Three tiers of "how much is this trusted":
