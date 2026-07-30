@@ -152,6 +152,18 @@ trade_log.jsonl   - append-only audit trail
 - **Scoped account.** Robinhood requires agent trades to route through a
   dedicated Agentic account, isolated from other holdings.
 
+### Observability
+
+- **`build_dashboard.py`.** A static, read-only HTML dashboard rendered
+  from `trade_log.jsonl` — no server, no connection back to the agent.
+  Full detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+![Dashboard from a live cycle: the session divergence panel firing for AAPL's 6.19% regular/extended gap](docs/images/dashboard.png)
+
+This is a real cycle from 2026-07-30, not a mockup — the divergence panel
+is the instrumentation catching a real after-hours move that the
+configured session correctly ignored.
+
 ## Known limitations
 
 Stated plainly because they're real, and because a reviewer will find them.
