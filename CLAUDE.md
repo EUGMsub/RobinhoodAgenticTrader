@@ -71,7 +71,7 @@ Each of these fixed a real bug. Reverting reintroduces it.
     access token) and refresh-token rotation handling.
   - **MCP tool calls (README #11):** `get_equity_quotes`, `get_accounts`, and
     `get_equity_positions` all worked against the live server — real quotes
-    fetched, agentic account (`602437931`) confirmed with 0 positions.
+    fetched, agentic account (`<agentic-account>`) confirmed with 0 positions.
     `EXECUTION_TOOLS`/`RECONCILE_TOOLS` remain unverified; no order has ever
     qualified for approval.
   - **MCP beta header (README #12):** resolved. `MCP_BETA_HEADER` was wrong

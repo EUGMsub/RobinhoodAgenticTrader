@@ -207,7 +207,7 @@ Stated plainly because they're real, and because a reviewer will find them.
     successfully — and the resulting access token authenticated real MCP
     calls: `get_equity_quotes`, `get_accounts`, and `get_equity_positions`
     all worked against the live server, fetching real watchlist quotes and
-    confirming the agentic account (`602437931`) had zero open positions.
+    confirming the agentic account (`<agentic-account>`) had zero open positions.
     The `READ_ONLY_TOOLS` allowlist in `agent.py` is verified;
     `EXECUTION_TOOLS`/`RECONCILE_TOOLS` are not, since no order has ever
     qualified for approval. What's still unverified: token **refresh** has
