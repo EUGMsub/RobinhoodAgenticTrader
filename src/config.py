@@ -10,7 +10,14 @@ import os
 from dataclasses import dataclass, field
 from typing import Mapping
 
+from dotenv import load_dotenv
+
 from guardrails import DEFAULT_CORRELATION_GROUPS, GuardrailConfig
+
+# Populate os.environ from .env (gitignored) before AgentConfig's
+# default_factory fields read it below. No-op if .env doesn't exist or a
+# variable is already set in the real environment (existing env wins).
+load_dotenv()
 
 
 @dataclass(frozen=True)
