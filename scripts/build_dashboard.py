@@ -130,6 +130,18 @@ def determine_mode(events: list[dict]) -> str:
     return "UNKNOWN"
 
 
+def _tail_since_last_cycle(events: list[dict]) -> list[dict]:
+    """Events at or after the most recent cycle_report — i.e. events that
+    describe the LATEST cycle, not already-known history from earlier
+    ones. Shared by every "most recent cycle only" reduction below, so
+    "most recent cycle" means the same window everywhere on the page."""
+    last_cycle_index = None
+    for i, e in enumerate(events):
+        if e.get("event") == "cycle_report":
+            last_cycle_index = i
+    return events[last_cycle_index:] if last_cycle_index is not None else []
+
+
 def summarize_health(events: list[dict]) -> dict:
     """Health is driven by the MOST RECENT cycle only.
 
@@ -153,13 +165,7 @@ def summarize_health(events: list[dict]) -> dict:
         else:
             age_text = f"{int(seconds // 86400)} days ago"
 
-    # Only events at or after the last cycle_report describe the latest
-    # cycle — earlier incomplete snapshots are already-known history.
-    last_cycle_index = None
-    for i, e in enumerate(events):
-        if e.get("event") == "cycle_report":
-            last_cycle_index = i
-    tail = events[last_cycle_index:] if last_cycle_index is not None else []
+    tail = _tail_since_last_cycle(events)
 
     snapshot_ok = any(e.get("event") == "market_snapshot" for e in tail) and not any(
         e.get("event") == "market_snapshot_incomplete" for e in tail
@@ -178,6 +184,64 @@ def summarize_health(events: list[dict]) -> dict:
         "missing_tickers": missing,
         "has_cycles": bool(cycles),
     }
+
+
+def _pct_gap(regular, extended) -> float | None:
+    if not isinstance(regular, (int, float)) or not isinstance(extended, (int, float)):
+        return None
+    if regular == 0:
+        return None
+    return abs(extended - regular) / abs(regular) * 100
+
+
+def collect_recent_signals(events: list[dict]) -> dict:
+    """Trust-boundary warning signals from the most recent cycle only:
+
+    - session_divergence: regular- and extended-hours prices disagree by
+      more than agent.py's threshold — the configured price_session may
+      be hiding a real move happening in the other session.
+    - snapshot_recomputed: the model's own day_change_pct disagreed with
+      the value agent.py recomputed in code from raw quote fields. The
+      recomputed value is what guardrails actually used.
+
+    Both event types were added to agent.py after this dashboard was
+    first written, so without this function they're logged and never
+    seen. Scoped to the most recent cycle for the same reason
+    summarize_health() is: it's what "is the agent trustworthy right
+    now" actually means.
+    """
+    tail = _tail_since_last_cycle(events)
+
+    divergences = []
+    for e in tail:
+        if e.get("event") != "session_divergence":
+            continue
+        regular = e.get("last_trade_price")
+        extended = e.get("last_non_reg_trade_price")
+        divergences.append(
+            {
+                "ticker": e.get("ticker"),
+                "last_trade_price": regular,
+                "last_non_reg_trade_price": extended,
+                "configured_session": e.get("configured_session"),
+                "pct_gap": _pct_gap(regular, extended),
+            }
+        )
+
+    recomputations = []
+    for e in tail:
+        if e.get("event") != "snapshot_recomputed":
+            continue
+        recomputations.append(
+            {
+                "ticker": e.get("ticker"),
+                "model_day_change_pct": e.get("model_day_change_pct"),
+                "recomputed_day_change_pct": e.get("recomputed_day_change_pct"),
+                "price_session": e.get("price_session"),
+            }
+        )
+
+    return {"session_divergences": divergences, "snapshot_recomputations": recomputations}
 
 
 def collect_snapshots(events: list[dict], limit: int = 10) -> list[dict]:
@@ -540,6 +604,79 @@ def _render_svg_chart(series: dict) -> str:
 """
 
 
+def _pct(value) -> str:
+    return f"{value:+.2f}%" if isinstance(value, (int, float)) else "—"
+
+
+def _pct_unsigned(value) -> str:
+    return f"{value:.2f}%" if isinstance(value, (int, float)) else "—"
+
+
+def _render_recent_signals(signals: dict) -> str:
+    """Render session_divergence / snapshot_recomputed panels for the
+    HEALTH section. Renders nothing at all — not an empty "no
+    divergences" panel — when there's nothing to show: absence of these
+    events is not evidence they were checked and came back clean vs. the
+    log simply predating this feature, so no all-clear claim is made
+    either way."""
+    divergences = signals.get("session_divergences") or []
+    recomputations = signals.get("snapshot_recomputations") or []
+
+    if not divergences and not recomputations:
+        return ""
+
+    blocks = []
+
+    if recomputations:
+        rows = "".join(
+            "<tr>"
+            f"<td><b>{_esc(r['ticker'])}</b></td>"
+            f"<td>{_esc(_pct(r['model_day_change_pct']))}</td>"
+            f"<td>{_esc(_pct(r['recomputed_day_change_pct']))}</td>"
+            f"<td>{_esc(r['price_session'] or '—')}</td>"
+            "</tr>"
+            for r in recomputations
+        )
+        blocks.append(f"""
+<div class="signal-block">
+  <h4>Model/code arithmetic disagreement</h4>
+  <p class="caveat">The model's own day_change_pct disagreed with the value
+  recomputed in code from raw quote fields, by more than the tolerance. The
+  recomputed value is what every guardrail decision this cycle actually used
+  — this is a trust-boundary signal, not routine noise.</p>
+  <table class="mini">
+    <thead><tr><th>Ticker</th><th>Model said</th><th>Recomputed</th><th>Session</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>""")
+
+    if divergences:
+        rows = "".join(
+            "<tr>"
+            f"<td><b>{_esc(d['ticker'])}</b></td>"
+            f"<td>{_money(d['last_trade_price'])}</td>"
+            f"<td>{_money(d['last_non_reg_trade_price'])}</td>"
+            f"<td>{_esc(_pct_unsigned(d['pct_gap']))}</td>"
+            f"<td>{_esc(d['configured_session'] or '—')}</td>"
+            "</tr>"
+            for d in divergences
+        )
+        blocks.append(f"""
+<div class="signal-block warn">
+  <h4>Session divergence</h4>
+  <p class="caveat">Regular- and extended-hours prices differ by more than
+  the threshold. A large gap means the configured price_session may be
+  hiding a real move happening in the other session.</p>
+  <table class="mini">
+    <thead><tr><th>Ticker</th><th>Regular price</th><th>Extended price</th>
+    <th>Gap</th><th>Configured session</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>""")
+
+    return "".join(blocks)
+
+
 def _render_decisions(rows: list[dict]) -> str:
     if not rows:
         return '<p class="empty">No decisions logged yet.</p>'
@@ -639,6 +776,7 @@ def render_dashboard(
 ) -> str:
     mode = determine_mode(events)
     health = summarize_health(events)
+    signals = collect_recent_signals(events)
     snapshots = collect_snapshots(events)
     decisions = collect_decisions(events, cfg)
     cost = collect_api_cost(events)
@@ -802,6 +940,11 @@ section {{ background:#fff; border:1px solid #e2e6ee; border-radius:10px;
 .status.warning {{ background:#fee2e2; color:#7f1d1d; }}
 .health-meta {{ flex:1; min-width:260px; }}
 .health-meta .big {{ font-size:17px; font-weight:600; }}
+.signal-block {{ background:#fdf7ed; border:1px solid #f0dcc0; border-radius:8px;
+  padding:13px 15px; margin-top:14px; }}
+.signal-block h4 {{ color:#92400e; letter-spacing:.03em; }}
+.signal-block.warn {{ background:#fee2e2; border-color:#fca5a5; }}
+.signal-block.warn h4 {{ color:#7f1d1d; }}
 .muted {{ color:#6b7280; font-weight:400; }}
 .caveat {{ font-size:12.5px; color:#6b7280; margin:6px 0; }}
 .empty {{ color:#8a91a0; font-style:italic; }}
@@ -897,6 +1040,7 @@ footer {{ text-align:center; color:#8a91a0; font-size:12px; margin-top:26px; }}
       <p class="caveat">{_esc(health_detail)}</p>
     </div>
   </div>
+  {_render_recent_signals(signals)}
   <p class="caveat">A stale timestamp is itself a finding: it means a scheduled
   run stopped without anyone noticing. Silence is not the same as no signal.</p>
 </section>

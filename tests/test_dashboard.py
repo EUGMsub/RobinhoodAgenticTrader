@@ -21,6 +21,7 @@ from build_dashboard import (
     build,
     collect_api_cost,
     collect_decisions,
+    collect_recent_signals,
     determine_mode,
     render_dashboard,
     summarize_health,
@@ -130,6 +131,36 @@ HEALTHY_SECOND_CYCLE = [
             "AAPL": {"current_price": 182.0, "day_change_pct": 1.1},
             "MSFT": {"current_price": 404.0, "day_change_pct": 1.0},
         },
+    },
+]
+
+CYCLE_WITH_RECENT_SIGNALS = [
+    {"ts": "2026-07-03T14:00:00+00:00", "event": "cycle_report", "report": "..."},
+    {
+        "ts": "2026-07-03T14:00:01+00:00",
+        "event": "market_snapshot",
+        "snapshot": {
+            "AAPL": {"current_price": 92.0, "day_change_pct": -8.0},
+            "MSFT": {"current_price": 400.0, "day_change_pct": 0.0},
+        },
+    },
+    {
+        "ts": "2026-07-03T14:00:02+00:00",
+        "event": "snapshot_recomputed",
+        "ticker": "AAPL",
+        "model_day_change_pct": -0.5,
+        "recomputed_day_change_pct": -8.0,
+        "price_session": "regular",
+        "current_price": 92.0,
+        "adjusted_previous_close": 100.0,
+    },
+    {
+        "ts": "2026-07-03T14:00:03+00:00",
+        "event": "session_divergence",
+        "ticker": "MSFT",
+        "last_trade_price": 400.0,
+        "last_non_reg_trade_price": 432.0,
+        "configured_session": "regular",
     },
 ]
 
@@ -436,3 +467,73 @@ class TestBuildAndCsv:
               out_path=out_path, cfg=_cfg())
 
         assert os.path.exists(out_path)
+
+
+class TestRecentSignals:
+    """session_divergence and snapshot_recomputed were added to agent.py
+    after this dashboard was first written — collect_recent_signals() and
+    its HEALTH-section rendering are what make them visible instead of
+    sitting unread in the log."""
+
+    def test_collect_returns_empty_when_neither_event_type_is_in_the_log(self):
+        events = COMPLETE_SNAPSHOT_EVENTS + HEALTHY_SECOND_CYCLE
+        signals = collect_recent_signals(events)
+
+        assert signals["session_divergences"] == []
+        assert signals["snapshot_recomputations"] == []
+
+    def test_collect_finds_both_event_types_from_the_most_recent_cycle(self):
+        events = COMPLETE_SNAPSHOT_EVENTS + CYCLE_WITH_RECENT_SIGNALS
+        signals = collect_recent_signals(events)
+
+        assert len(signals["snapshot_recomputations"]) == 1
+        recompute = signals["snapshot_recomputations"][0]
+        assert recompute["ticker"] == "AAPL"
+        assert recompute["model_day_change_pct"] == -0.5
+        assert recompute["recomputed_day_change_pct"] == -8.0
+        assert recompute["price_session"] == "regular"
+
+        assert len(signals["session_divergences"]) == 1
+        divergence = signals["session_divergences"][0]
+        assert divergence["ticker"] == "MSFT"
+        assert divergence["last_trade_price"] == 400.0
+        assert divergence["last_non_reg_trade_price"] == 432.0
+        assert divergence["configured_session"] == "regular"
+        assert divergence["pct_gap"] == pytest.approx(8.0)
+
+    def test_signals_from_an_earlier_cycle_do_not_leak_into_a_clean_latest_cycle(self):
+        # The whole point of scoping to "most recent cycle" is that a
+        # resolved issue from an earlier cycle must not keep showing up
+        # forever, the same way summarize_health() already works.
+        events = CYCLE_WITH_RECENT_SIGNALS + HEALTHY_SECOND_CYCLE
+        signals = collect_recent_signals(events)
+
+        assert signals["session_divergences"] == []
+        assert signals["snapshot_recomputations"] == []
+
+    def test_no_signal_block_renders_when_neither_event_type_is_present(self):
+        events = COMPLETE_SNAPSHOT_EVENTS + HEALTHY_SECOND_CYCLE
+        out = render_dashboard(events, None, _cfg())
+
+        # Not just "no warning text" — no panel at all, since a log that
+        # never logged these events either checked and found nothing, or
+        # predates the feature entirely. Neither should render as a
+        # reassuring all-clear.
+        assert '<div class="signal-block' not in out
+
+    def test_both_signal_blocks_render_with_their_data_when_present(self):
+        events = COMPLETE_SNAPSHOT_EVENTS + CYCLE_WITH_RECENT_SIGNALS
+        out = render_dashboard(events, None, _cfg())
+
+        assert '<div class="signal-block">' in out
+        assert '<div class="signal-block warn">' in out
+        assert "Model/code arithmetic disagreement" in out
+        assert "Session divergence" in out
+
+        # The actual reported numbers must be on the page, not just the
+        # section headers.
+        assert "-0.50%" in out
+        assert "-8.00%" in out
+        assert "$400.00" in out
+        assert "$432.00" in out
+        assert "8.00%" in out
