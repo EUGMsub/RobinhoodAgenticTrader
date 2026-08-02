@@ -154,6 +154,14 @@ trade_log.jsonl   - append-only audit trail
 
 ### Observability
 
+- **Market snapshot logging.** Every cycle logs the raw quote fields for every
+  watchlist ticker whether or not an order was proposed — the only way to tell
+  "fetched real data, nothing qualified" apart from "the tool call failed."
+  A missing or incomplete snapshot raises a loud warning rather than looking
+  like a quiet, uneventful day.
+- **Token cost logging.** Every API call logs real token counts and an estimated
+  dollar cost, attributed by call type, so operating cost can be compared
+  against realized P&L instead of assumed negligible.
 - **`build_dashboard.py`.** A static, read-only HTML dashboard rendered
   from `trade_log.jsonl` — no server, no connection back to the agent.
   Full detail in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
