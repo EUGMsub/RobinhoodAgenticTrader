@@ -11,6 +11,12 @@ Paper-trade without ever placing a real order or prompting for approval:
 
 Run a cycle and immediately inspect the result in a browser:
     python scripts/run_agent.py --dry-run --dashboard
+
+Unattended (cron, Task Scheduler): --scheduled requires --dry-run, so an
+unattended invocation can never block on human approval or place a real
+order. A cycle that raises is logged as "cycle_failed" before the process
+exits non-zero, rather than vanishing silently.
+    python scripts/run_agent.py --scheduled --dry-run
 """
 
 import argparse
@@ -33,6 +39,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from agent import run_cycle
 from config import AgentConfig
+from logging_utils import log_event
 
 
 def main() -> None:
@@ -53,7 +60,28 @@ def main() -> None:
             "completes. The dashboard is read-only and cannot control the agent."
         ),
     )
+    parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help=(
+            "Mark this as an unattended/scheduled invocation (e.g. cron, Task "
+            "Scheduler). Requires --dry-run — a scheduled run must never be "
+            "able to block on confirm_with_human() with no terminal attached, "
+            "or reach the execution path unattended."
+        ),
+    )
     args = parser.parse_args()
+
+    # Checked before anything else touches config or credentials: a
+    # scheduled invocation with no human present must be structurally
+    # incapable of reaching approval or execution, not just unlikely to.
+    if args.scheduled and not args.dry_run:
+        sys.exit(
+            "--scheduled requires --dry-run: without it, a scheduled run "
+            "with approval_mode=True would block forever on input() with no "
+            "terminal attached, and one with approval_mode=False would place "
+            "real orders unattended."
+        )
 
     cfg = AgentConfig()
     if args.dry_run:
@@ -70,7 +98,33 @@ def main() -> None:
         f"| Dry run: {cfg.dry_run}"
     )
 
-    report = run_cycle(cfg)
+    # Logged before the cycle actually runs so a process that dies
+    # mid-flight (killed, OOM, power loss) is distinguishable in
+    # trade_log.jsonl from one that never started at all.
+    log_event(
+        cfg.log_file,
+        "cycle_started",
+        scheduled=args.scheduled,
+        dry_run=cfg.dry_run,
+        approval_mode=cfg.approval_mode,
+    )
+
+    try:
+        report = run_cycle(cfg)
+    except Exception as e:
+        # A scheduled run has no one watching the terminal — without this,
+        # an unhandled exception leaves only a Task Scheduler/cron exit
+        # code and no evidence in the one place this project's audit trail
+        # actually lives. Re-raised unchanged so the process still exits
+        # non-zero and the traceback still reaches the scheduler's log.
+        log_event(
+            cfg.log_file,
+            "cycle_failed",
+            exception_type=type(e).__name__,
+            exception_message=str(e),
+        )
+        raise
+
     print("\n===== AGENT REPORT =====\n")
     print(report)
 
