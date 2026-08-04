@@ -24,7 +24,7 @@ its arithmetic, or its report of what it did.
 
 ## Status
 
-- ✅ 183 unit tests (`pytest tests/ -v`) — 182 passing, one POSIX-only file
+- ✅ 193 unit tests (`pytest tests/ -v`) — 192 passing, one POSIX-only file
   permission check skipped on Windows. No credentials required to verify.
 - ✅ Backtested against ~2 years of real daily bars. Results below.
 - ✅ Agent orchestration, MCP wiring, batch validation, instrument-type
@@ -85,14 +85,14 @@ days that trade (execution, then reconciliation). Across ~500 trading days,
 of magnitude as the returns. **At small account sizes, an LLM-driven trading
 agent can cost roughly as much to operate as it earns.**
 
-**First real measurement (2026-07-30):** two live proposal-only cycles (no
-order qualified either time, so no execution/reconciliation calls) cost
-$0.0549 and $0.0616 — about 5.5–6.2 cents each. Two data points, not an
-average, and execution/reconciliation cost on a trade day remains
-unmeasured. But at ~6 cents/day, ~500 trading days of proposal calls alone
-would run roughly $27–31 — squarely in the same order of magnitude as the
-backtest's entire $32.24 two-year profit, confirming the concern above
-wasn't theoretical.
+**Measured (five live cycles through 2026-08-02):** logged `api_usage`
+events put five proposal-call cycles at $0.33 total, averaging about 6.5
+cents each. This is proposal-call cost only — no order has yet qualified for
+approval, so execution and reconciliation calls have never run, and real
+per-trade cost is higher than this figure once they do. At ~6.5 cents/day,
+~500 trading days of proposal calls alone would run roughly $32 — squarely
+in the same order of magnitude as the backtest's entire $32.24 two-year
+profit, confirming the concern above wasn't theoretical.
 
 ### On the 72.7% win rate
 
@@ -151,6 +151,10 @@ trade_log.jsonl   - append-only audit trail
   without a per-order `YES`.
 - **Scoped account.** Robinhood requires agent trades to route through a
   dedicated Agentic account, isolated from other holdings.
+- **Independent kill switch.** Disconnecting the agent in the Robinhood app
+  revokes its OAuth grant. This is the only stop mechanism that works even if
+  this codebase is compromised, buggy, or unreachable — every other
+  safeguard here runs inside the process being trusted.
 
 ### Observability
 
@@ -273,7 +277,7 @@ Stated plainly because they're real, and because a reviewer will find them.
 git clone https://github.com/EUGMsub/RobinhoodAgenticTrader.git
 cd RobinhoodAgenticTrader
 pip install -r requirements.txt
-pytest tests/ -v          # 183 tests (182 pass, 1 skipped on Windows), no credentials needed
+pytest tests/ -v          # 193 tests (192 pass, 1 skipped on Windows), no credentials needed
 ```
 
 Reproduce the backtest (no credentials, no funded account):
@@ -308,7 +312,7 @@ src/
   oauth.py          OAuth 2.1 authorization-code + PKCE client for the MCP server
   backtest.py       pure replay engine - reuses guardrails unchanged
   logging_utils.py  append-only structured audit log
-tests/              183 tests (182 pass, 1 skipped on Windows), zero network calls
+tests/              193 tests (192 pass, 1 skipped on Windows), zero network calls
 scripts/
   run_agent.py        live agent entry point
   oauth_login.py      one-time interactive OAuth login

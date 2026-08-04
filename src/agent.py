@@ -56,6 +56,7 @@ from paper_trading import (
     apply_simulated_buy,
     apply_simulated_sell,
     load_paper_portfolio,
+    mark_to_market,
     save_paper_portfolio,
     summarize,
 )
@@ -547,11 +548,18 @@ def _execute_and_reconcile(
         )
 
 
-def _run_dry_run_cycle(cfg: AgentConfig, gcfg, proposed: list[dict]) -> None:
+def _run_dry_run_cycle(
+    cfg: AgentConfig, gcfg, proposed: list[dict], recomputed_snapshot: dict[str, dict]
+) -> None:
     """Simulate a cycle's approved orders against a persisted paper
     portfolio. No human prompt, no MCP order-placing call, no MCP
     reconciliation call — dry_run only ever reads market data (already
     fetched in the caller's cycle-report call) and simulates fills locally.
+
+    `recomputed_snapshot` (this cycle's code-recomputed prices, keyed by
+    ticker) marks every held position to market before saving/summarizing —
+    without this, last_price only ever updates at fill time and unrealized
+    P&L reads $0.00 between fills even as the market moves.
     """
     assert cfg.dry_run, "internal error: dry-run path reached with dry_run=False"
 
@@ -612,6 +620,10 @@ def _run_dry_run_cycle(cfg: AgentConfig, gcfg, proposed: list[dict]) -> None:
             order=order,
         )
 
+    portfolio = mark_to_market(
+        portfolio,
+        {ticker: entry["current_price"] for ticker, entry in recomputed_snapshot.items()},
+    )
     save_paper_portfolio(cfg.paper_portfolio_file, portfolio)
 
     summary = summarize(portfolio, cfg.initial_cash)
@@ -683,7 +695,7 @@ def run_cycle(cfg: AgentConfig, client: anthropic.Anthropic | None = None) -> st
     gcfg = cfg.guardrail_config()
 
     if cfg.dry_run:
-        _run_dry_run_cycle(cfg, gcfg, proposed)
+        _run_dry_run_cycle(cfg, gcfg, proposed, recomputed_snapshot)
         return text
 
     # Buy proposals each carry the model's snapshot of current account

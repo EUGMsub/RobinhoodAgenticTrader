@@ -19,6 +19,7 @@ from paper_trading import (
     apply_simulated_buy,
     apply_simulated_sell,
     load_paper_portfolio,
+    mark_to_market,
     save_paper_portfolio,
     summarize,
 )
@@ -94,6 +95,47 @@ class TestApplySimulatedSell:
         assert result.cash == 180.0
 
 
+class TestMarkToMarket:
+    def test_updates_last_price_for_a_held_ticker(self):
+        portfolio = PaperPortfolio(
+            cash=100.0,
+            positions={"AAPL": PaperPosition(shares=1.0, avg_cost=100.0, last_price=100.0)},
+        )
+        result = mark_to_market(portfolio, {"AAPL": 120.0})
+
+        assert result.positions["AAPL"].last_price == 120.0
+        assert result.positions["AAPL"].shares == 1.0
+        assert result.positions["AAPL"].avg_cost == 100.0
+
+    def test_does_not_mutate_the_input_portfolio(self):
+        portfolio = PaperPortfolio(
+            cash=100.0,
+            positions={"AAPL": PaperPosition(shares=1.0, avg_cost=100.0, last_price=100.0)},
+        )
+        mark_to_market(portfolio, {"AAPL": 120.0})
+
+        assert portfolio.positions["AAPL"].last_price == 100.0
+
+    def test_ignores_prices_for_tickers_not_held(self):
+        portfolio = PaperPortfolio(cash=100.0)
+        result = mark_to_market(portfolio, {"AAPL": 120.0})
+
+        assert result.positions == {}
+
+    def test_leaves_last_price_unchanged_for_a_held_ticker_missing_from_prices(self):
+        portfolio = PaperPortfolio(
+            cash=100.0,
+            positions={
+                "AAPL": PaperPosition(shares=1.0, avg_cost=100.0, last_price=100.0),
+                "MSFT": PaperPosition(shares=1.0, avg_cost=200.0, last_price=200.0),
+            },
+        )
+        result = mark_to_market(portfolio, {"AAPL": 120.0})
+
+        assert result.positions["AAPL"].last_price == 120.0
+        assert result.positions["MSFT"].last_price == 200.0
+
+
 class TestSummarize:
     def test_all_cash_no_positions(self):
         portfolio = PaperPortfolio(cash=400.0)
@@ -115,6 +157,22 @@ class TestSummarize:
         assert summary["unrealized_pnl"] == pytest.approx(5.0)
         assert summary["total_equity"] == pytest.approx(405.0)
         assert summary["total_pnl"] == pytest.approx(5.0)
+
+    def test_unrealized_pnl_reflects_a_price_move_with_no_new_fill(self):
+        # Regression test: summarize() only ever reads last_price, and
+        # last_price only updates via apply_simulated_buy/sell or
+        # mark_to_market — never on its own. A held position whose price
+        # moves without a new fill must still show non-zero unrealized P&L
+        # once the caller marks it to the latest snapshot price.
+        portfolio = PaperPortfolio(
+            cash=397.0,
+            positions={"AAPL": PaperPosition(shares=0.01, avg_cost=300.0, last_price=300.0)},
+        )
+        marked = mark_to_market(portfolio, {"AAPL": 310.0})
+        summary = summarize(marked, initial_cash=400.0)
+
+        assert summary["unrealized_pnl"] == pytest.approx(0.10)
+        assert summary["total_pnl"] == pytest.approx(0.10)
 
     def test_total_pnl_combines_realized_and_unrealized(self):
         portfolio = PaperPortfolio(

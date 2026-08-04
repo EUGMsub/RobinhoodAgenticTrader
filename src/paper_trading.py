@@ -118,11 +118,33 @@ def apply_simulated_sell(
     )
 
 
+def mark_to_market(portfolio: PaperPortfolio, prices: dict[str, float]) -> PaperPortfolio:
+    """Return a NEW portfolio with last_price updated to `prices` for every
+    held ticker `prices` has a quote for — does not mutate `portfolio`.
+    Tickers absent from `prices` keep their existing last_price unchanged
+    (e.g. a watchlist ticker whose snapshot failed to recompute this cycle).
+
+    Callers should call this once per cycle with the latest recomputed
+    market snapshot, before summarize(), so unrealized P&L reflects current
+    prices rather than going stale between fills."""
+    positions = dict(portfolio.positions)
+    for ticker, price in prices.items():
+        existing = positions.get(ticker)
+        if existing is not None:
+            positions[ticker] = PaperPosition(
+                shares=existing.shares, avg_cost=existing.avg_cost, last_price=price
+            )
+    return PaperPortfolio(
+        cash=portfolio.cash, positions=positions, realized_pnl=portfolio.realized_pnl
+    )
+
+
 def summarize(portfolio: PaperPortfolio, initial_cash: float) -> dict:
-    """Mark-to-market summary using each position's last known price — the
-    price of its most recent simulated fill. This ledger has no continuous
-    quote feed for positions the strategy didn't touch this cycle, so
-    unrealized P&L is only as fresh as the last fill for that ticker."""
+    """Mark-to-market summary using each position's last_price. That field
+    reflects the latest market snapshot only if the caller kept it fresh via
+    mark_to_market() this cycle — summarize() itself has no quote feed, so a
+    stale last_price (e.g. from a ticker mark_to_market() didn't get a price
+    for) produces stale unrealized P&L here too."""
     positions_value = sum(
         pos.shares * pos.last_price for pos in portfolio.positions.values()
     )
