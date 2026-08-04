@@ -24,8 +24,11 @@ its arithmetic, or its report of what it did.
 
 ## Status
 
-- ✅ 193 unit tests (`pytest tests/ -v`) — 192 passing, one POSIX-only file
-  permission check skipped on Windows. No credentials required to verify.
+- ✅ 214 unit tests (`pytest tests/ -v`) — 205 passing; 9 skipped by
+  default (one POSIX-only file permission check on Windows, plus 8 opt-in
+  live prompt-injection probes that require `RUN_LIVE_INJECTION_TESTS=1`
+  and real credentials — see Known Limitations #4). No credentials required
+  to verify the 205.
 - ✅ Backtested against ~2 years of real daily bars. Results below.
 - ✅ Agent orchestration, MCP wiring, batch validation, instrument-type
   enforcement, post-execution reconciliation, CLI approval flow.
@@ -194,9 +197,28 @@ Stated plainly because they're real, and because a reviewer will find them.
 3. **Capacity/reconciliation seam.** `running_positions` updates on
    approve-and-execute, before reconciliation runs. If reconciliation flags a
    mismatch, capacity was already assumed spent. Fails conservative.
-4. **No prompt-injection testing.** Market data and tool output are untrusted
-   text reaching a model with a path to order placement. The guardrails bound
-   the damage; there is no test suite proving it.
+4. **Prompt injection is tested at the guardrail layer, not the model
+   layer.** Market data and tool output are untrusted text reaching a model
+   with a path to order placement. `tests/test_prompt_injection.py` assumes
+   the worst case — a fully compromised model emitting exactly the
+   proposals an injected instruction would produce (off-watchlist ticker,
+   oversized order, an OCC option identifier as the ticker, a batch that
+   individually clears the group cap but collectively breaches it, a sell
+   with no cost basis) — and asserts `validate_batch()` blocks every one of
+   them, plus that the proposal call's toolset structurally excludes
+   order-placing tools. 13 deterministic tests, no network calls, no
+   dependency on whether the model actually refuses anything (that's not a
+   property this project can guarantee — see
+   `tests/test_injection_live.py`, opt-in and unasserted on model
+   behavior). What's still open: **input falsification is not defended.**
+   Guardrails re-derive decisions from model-reported inputs, never the
+   inputs themselves — if the raw quote fields a model reports are
+   falsified, the "independent" recomputation faithfully derives a
+   decision from a lie. `TestInputFalsificationIsNotDefended` in that same
+   file documents this as a passing characterization test: it fabricates
+   AAPL's previous close to manufacture a fake ~48% dip and confirms the
+   order is approved. Same root cause as limitation #1, and the same fix —
+   fetching market data independently of the model.
 
 **Backtest**
 
@@ -277,7 +299,7 @@ Stated plainly because they're real, and because a reviewer will find them.
 git clone https://github.com/EUGMsub/RobinhoodAgenticTrader.git
 cd RobinhoodAgenticTrader
 pip install -r requirements.txt
-pytest tests/ -v          # 193 tests (192 pass, 1 skipped on Windows), no credentials needed
+pytest tests/ -v          # 214 tests (205 pass, 9 skipped by default), no credentials needed
 ```
 
 Reproduce the backtest (no credentials, no funded account):
@@ -312,7 +334,8 @@ src/
   oauth.py          OAuth 2.1 authorization-code + PKCE client for the MCP server
   backtest.py       pure replay engine - reuses guardrails unchanged
   logging_utils.py  append-only structured audit log
-tests/              193 tests (192 pass, 1 skipped on Windows), zero network calls
+tests/              214 tests (205 pass, 9 skipped by default), no network
+                    calls unless RUN_LIVE_INJECTION_TESTS=1 is set
 scripts/
   run_agent.py        live agent entry point
   oauth_login.py      one-time interactive OAuth login
