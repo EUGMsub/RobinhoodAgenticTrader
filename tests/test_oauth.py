@@ -214,6 +214,56 @@ class TestGetValidAccessToken:
         assert persisted["access_token"] == "refreshed"
         assert persisted["refresh_token"] == "new-refresh"
 
+    def test_force_refresh_refreshes_even_when_not_expired(self, tmp_path, monkeypatch):
+        # mcp_client._call_tool()'s one-retry-on-401 logic relies on this:
+        # a 401 despite a locally-unexpired token means the local expiry
+        # cache is wrong, and the ordinary expiry check alone would just
+        # hand back the same stale token again.
+        path = str(tmp_path / "tokens.json")
+        save_tokens(
+            {
+                "access_token": "still-good-by-expiry",
+                "refresh_token": "old-refresh",
+                "expires_at": time.time() + 3600,  # nowhere near expiring
+            },
+            path=path,
+        )
+
+        captured_requests = []
+
+        def _fake_urlopen(req, timeout=None):
+            captured_requests.append(req)
+            return _FakeHTTPResponse(
+                {"access_token": "force-refreshed", "refresh_token": "new-refresh", "expires_in": 3600}
+            )
+
+        monkeypatch.setattr(oauth.urllib.request, "urlopen", _fake_urlopen)
+
+        token = get_valid_access_token("client-id", path=path, force_refresh=True)
+
+        assert token == "force-refreshed"
+        assert len(captured_requests) == 1
+
+    def test_force_refresh_false_is_the_default_and_does_not_refresh(self, tmp_path, monkeypatch):
+        path = str(tmp_path / "tokens.json")
+        save_tokens(
+            {
+                "access_token": "still-good",
+                "refresh_token": "r",
+                "expires_at": time.time() + 3600,
+            },
+            path=path,
+        )
+
+        def _explode(*a, **k):
+            raise AssertionError("urlopen must not be called when force_refresh is not set")
+
+        monkeypatch.setattr(oauth.urllib.request, "urlopen", _explode)
+
+        token = get_valid_access_token("client-id", path=path)
+
+        assert token == "still-good"
+
     def test_refresh_keeps_old_refresh_token_if_server_omits_a_new_one(
         self, tmp_path, monkeypatch
     ):

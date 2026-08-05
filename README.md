@@ -24,7 +24,7 @@ its arithmetic, or its report of what it did.
 
 ## Status
 
-- ✅ 214 unit tests (`pytest tests/ -v`) — 205 passing; 9 skipped by
+- ✅ 250 unit tests (`pytest tests/ -v`) — 241 passing; 9 skipped by
   default (one POSIX-only file permission check on Windows, plus 8 opt-in
   live prompt-injection probes that require `RUN_LIVE_INJECTION_TESTS=1`
   and real credentials — see Known Limitations #4). No credentials required
@@ -185,15 +185,38 @@ Stated plainly because they're real, and because a reviewer will find them.
 
 **Trust boundary**
 
-1. **Guardrails re-derive decisions, not inputs.** The model supplies
-   `day_change_pct`, `days_held`, and `positions`. A model that misreports an
-   input gets a validated decision on false data. Narrowing this requires
-   fetching market data independently of the model.
-2. **Reconciliation is model-mediated.** The same model that executes is asked
-   to report what it executed. This catches accidental failures — confused
-   models, tool errors, duplicate fills — but is worth little against anything
-   adversarial. A direct HTTP call to the MCP server from Python, with no model
-   in the loop, would close it.
+1. **Guardrails re-derive decisions from model-reported inputs — partially
+   narrowed, not closed.** `src/mcp_client.py` is a direct HTTP client for
+   Robinhood's MCP server (no model in the loop; see its module docstring for
+   the wire protocol, discovered against the live server). With
+   `AgentConfig.verify_inputs=True` (the default), `run_cycle()` calls
+   `mcp_client.fetch_quotes()` directly and compares `last_trade_price`,
+   `last_non_reg_trade_price`, and `adjusted_previous_close` against what the
+   model reported; a mismatch beyond a small tolerance logs an
+   `input_falsified` event and the fetched value — never the model's — is
+   used for validation. `tests/test_prompt_injection.py`'s
+   `TestInputFalsificationIsDetected` proves this against the same falsified-
+   previous-close scenario limitation #4 describes: the fabricated ~48% dip
+   is caught and the order is blocked. **What's still open:** `days_held`,
+   `avg_cost`, and `positions` (per-ticker/group/total exposure for a buy)
+   remain entirely model-reported and unverified.
+   `mcp_client.fetch_positions()` exists and is tested
+   (`tests/test_mcp_client.py`) but is not yet wired into the
+   position/exposure validation path — a model that misreports one of those
+   still gets a validated decision on false data. Also note `verify_inputs`
+   is a config flag, not a removed code path: with it set to `False`,
+   quote-field falsification is unverified too (see
+   `TestInputFalsificationIsNotDefendedWhenVerificationIsOff`).
+2. **~~Reconciliation was model-mediated.~~ Fixed.** The same model that
+   executed an order used to be asked, in a second LLM call, to also report
+   what it did — worth little against anything adversarial, and it cost real
+   tokens for a check that added no independent evidence. `_execute_and_reconcile()`
+   now calls `mcp_client.fetch_orders()` directly after execution — a plain
+   HTTP fetch, no model, no LLM cost — and feeds the result to
+   `reconcile.reconcile_order()` unchanged. `tests/test_agent.py`'s
+   `TestReconciliationAgainstDirectlyFetchedOrders` confirms it still catches
+   an option order or a dollar-amount mismatch the same way it always did,
+   against the new data source.
 3. **Capacity/reconciliation seam.** `running_positions` updates on
    approve-and-execute, before reconciliation runs. If reconciliation flags a
    mismatch, capacity was already assumed spent. Fails conservative.
@@ -206,19 +229,21 @@ Stated plainly because they're real, and because a reviewer will find them.
    individually clears the group cap but collectively breaches it, a sell
    with no cost basis) — and asserts `validate_batch()` blocks every one of
    them, plus that the proposal call's toolset structurally excludes
-   order-placing tools. 13 deterministic tests, no network calls, no
+   order-placing tools. 14 deterministic tests, no network calls, no
    dependency on whether the model actually refuses anything (that's not a
    property this project can guarantee — see
    `tests/test_injection_live.py`, opt-in and unasserted on model
-   behavior). What's still open: **input falsification is not defended.**
-   Guardrails re-derive decisions from model-reported inputs, never the
-   inputs themselves — if the raw quote fields a model reports are
-   falsified, the "independent" recomputation faithfully derives a
-   decision from a lie. `TestInputFalsificationIsNotDefended` in that same
-   file documents this as a passing characterization test: it fabricates
-   AAPL's previous close to manufacture a fake ~48% dip and confirms the
-   order is approved. Same root cause as limitation #1, and the same fix —
-   fetching market data independently of the model.
+   behavior). This includes the one injection payload that used to be
+   entirely undefended: `misreport_price_field`, a falsified
+   `adjusted_previous_close` manufacturing a fake dip.
+   `TestInputFalsificationIsDetected` proves `verify_inputs=True` (the
+   default — see limitation #1) catches it: an `input_falsified` event
+   fires and the order is blocked, not approved. **What's still open:**
+   `verify_inputs` can be turned off, and even when it's on it only checks
+   quote fields — `TestInputFalsificationIsNotDefendedWhenVerificationIsOff`
+   documents the same falsified-previous-close scenario producing an
+   approved order with `verify_inputs=False`, and `avg_cost`/`days_held`/
+   `positions` are unverified regardless of the flag (see limitation #1).
 
 **Backtest**
 
@@ -254,9 +279,11 @@ Stated plainly because they're real, and because a reviewer will find them.
     calls: `get_equity_quotes`, `get_accounts`, and `get_equity_positions`
     all worked against the live server, fetching real watchlist quotes and
     confirming the agentic account (`<agentic-account>`) had zero open positions.
-    The `READ_ONLY_TOOLS` allowlist in `agent.py` is verified;
-    `EXECUTION_TOOLS`/`RECONCILE_TOOLS` are not, since no order has ever
-    qualified for approval. What's still unverified: token **refresh** has
+    The `READ_ONLY_TOOLS` allowlist in `agent.py` is verified; `EXECUTION_TOOLS`
+    is not, since no order has ever qualified for approval. (`RECONCILE_TOOLS`
+    no longer exists — reconciliation is a direct `mcp_client.fetch_orders()`
+    call now, not a model-mediated MCP call restricted to an allowlist; see
+    Known Limitation #2.) What's still unverified: token **refresh** has
     not been exercised (it requires an actually-expired access token, which
     no login so far has produced), and refresh-token rotation handling
     (`_refresh_tokens()`'s fallback for a server that omits a new
@@ -299,7 +326,7 @@ Stated plainly because they're real, and because a reviewer will find them.
 git clone https://github.com/EUGMsub/RobinhoodAgenticTrader.git
 cd RobinhoodAgenticTrader
 pip install -r requirements.txt
-pytest tests/ -v          # 214 tests (205 pass, 9 skipped by default), no credentials needed
+pytest tests/ -v          # 250 tests (241 pass, 9 skipped by default), no credentials needed
 ```
 
 Reproduce the backtest (no credentials, no funded account):
@@ -332,9 +359,10 @@ src/
   reconcile.py      pure post-execution order verification
   agent.py          orchestration: MCP calls, validation, approval, execution
   oauth.py          OAuth 2.1 authorization-code + PKCE client for the MCP server
+  mcp_client.py     direct HTTP MCP client (quotes/positions/orders) - no model
   backtest.py       pure replay engine - reuses guardrails unchanged
   logging_utils.py  append-only structured audit log
-tests/              214 tests (205 pass, 9 skipped by default), no network
+tests/              250 tests (241 pass, 9 skipped by default), no network
                     calls unless RUN_LIVE_INJECTION_TESTS=1 is set
 scripts/
   run_agent.py        live agent entry point

@@ -43,6 +43,15 @@ class AgentConfig:
         default_factory=lambda: DEFAULT_CORRELATION_GROUPS
     )
     max_group_dollars: float = 8.0
+    # When True, run_cycle() independently fetches quotes via
+    # mcp_client.fetch_quotes() (no model in the loop) and compares them
+    # against the model-reported market_snapshot fields before validation.
+    # A mismatch beyond a small tolerance means the model's reported input
+    # was wrong or falsified — the DIRECTLY FETCHED value wins, never the
+    # model's (see README Known Limitation #1). Defaults on: verification
+    # costs one extra HTTP round trip per cycle, not an LLM call, so
+    # there's no reason to run unverified by default.
+    verify_inputs: bool = True
 
     # --- backtest-only parameters (not part of live guardrails) ---
     slippage_pct: float = 0.05

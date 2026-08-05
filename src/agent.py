@@ -51,6 +51,7 @@ import anthropic
 from config import AgentConfig
 from guardrails import validate_batch
 from logging_utils import log_event
+from mcp_client import fetch_orders, fetch_quotes
 from oauth import get_valid_access_token
 from paper_trading import (
     apply_simulated_buy,
@@ -84,11 +85,11 @@ READ_ONLY_TOOLS: tuple[str, ...] = (
 # trade. Used only where an order is genuinely meant to be placed.
 EXECUTION_TOOLS: tuple[str, ...] = READ_ONLY_TOOLS + ("place_equity_order",)
 
-# Reconciliation only ever reads order records back — never re-derives a
-# quote or places anything. get_option_orders stays in this list on
-# purpose: reconciliation's whole job is to notice an option order that
-# shouldn't be there, and it can't notice one it isn't allowed to fetch.
-RECONCILE_TOOLS: tuple[str, ...] = ("get_equity_orders", "get_option_orders")
+# Reconciliation used to be a model-mediated MCP call restricted to this
+# allowlist. It's now mcp_client.fetch_orders() — a direct HTTP call, no
+# model, no toolset to restrict — which is strictly stronger: fetch_orders()
+# always reads get_option_orders itself rather than depending on a model
+# being given, and choosing to use, the right tool.
 
 
 def _mcp_server_block(cfg: AgentConfig) -> list[dict]:
@@ -165,6 +166,26 @@ SNAPSHOT_RECOMPUTE_TOLERANCE_PCT = 0.05
 # large move happening in the other session.
 SESSION_DIVERGENCE_THRESHOLD_PCT = 1.0
 
+# A model-reported quote field within this many percent of the value
+# fetch_quotes() independently fetched is treated as ordinary staleness —
+# our fetch happens a few seconds after the model's, so a live price can
+# have genuinely moved a little in between. Previous close doesn't move
+# intraday at all, but is checked against the same tolerance for
+# simplicity; a real falsification (see
+# tests/test_prompt_injection.py's input-falsification tests) is nowhere
+# close to this boundary.
+INPUT_VERIFICATION_TOLERANCE_PCT = 0.5
+
+# The market_snapshot fields verified against a direct fetch, each mapped
+# to the field name fetch_quotes() returns it under (identical here, but
+# named separately so the two sides of the comparison are never silently
+# assumed to line up).
+VERIFIED_QUOTE_FIELDS: tuple[str, ...] = (
+    "last_trade_price",
+    "last_non_reg_trade_price",
+    "adjusted_previous_close",
+)
+
 
 def _select_session_price(cfg: AgentConfig, raw: dict) -> float | None:
     """Return the price for cfg.price_session from one ticker's raw quote
@@ -234,6 +255,114 @@ def _recompute_snapshot(cfg: AgentConfig, raw_snapshot: dict) -> dict[str, dict]
         recomputed[key] = entry
 
     return recomputed
+
+
+def _quote_field_falsified(model_value, fetched_value) -> bool:
+    """True if `model_value` (from the model's market_snapshot) disagrees
+    with `fetched_value` (from mcp_client.fetch_quotes(), fetched directly
+    with no model in the loop) by more than
+    INPUT_VERIFICATION_TOLERANCE_PCT. Either value being missing or
+    non-numeric is "can't compare", not "falsified" — this function never
+    flags what it can't actually check.
+    """
+    if model_value is None or fetched_value is None:
+        return False
+    try:
+        model_f = float(model_value)
+        fetched_f = float(fetched_value)
+    except (TypeError, ValueError):
+        return False
+    if fetched_f == 0:
+        return model_f != 0
+    return abs(model_f - fetched_f) / abs(fetched_f) * 100 > INPUT_VERIFICATION_TOLERANCE_PCT
+
+
+def _coerce_quote_price_fields(quote: dict) -> dict:
+    """mcp_client.fetch_quotes() reports numeric fields as STRINGS — the
+    live server's own convention (see mcp_client.py's module docstring),
+    confirmed against a real response, not assumed. _recompute_snapshot()
+    requires int/float (`isinstance(x, (int, float))`), since it was built
+    to parse the model's JSON, which reports real numbers. This bridges
+    the two without loosening _recompute_snapshot()'s own type check —
+    that check stays strict on purpose for the model-reported path, where
+    a stringified number would itself be a red flag.
+    """
+    coerced = dict(quote)
+    for field in ("last_trade_price", "last_non_reg_trade_price", "adjusted_previous_close"):
+        value = quote.get(field)
+        if value is None:
+            continue
+        try:
+            coerced[field] = float(value)
+        except (TypeError, ValueError):
+            coerced[field] = None
+    return coerced
+
+
+def _verify_inputs_against_live_quotes(
+    cfg: AgentConfig, recomputed: dict[str, dict]
+) -> dict[str, dict]:
+    """Independently fetch quotes for every ticker in `recomputed` via
+    mcp_client.fetch_quotes() — no model in the loop — and compare
+    last_trade_price, last_non_reg_trade_price, and adjusted_previous_close
+    against what the model reported for that ticker.
+
+    A model-reported field beyond INPUT_VERIFICATION_TOLERANCE_PCT of the
+    directly-fetched value logs an "input_falsified" event (both values)
+    and that ticker's entry is REPLACED with one recomputed from the
+    fetched quote instead of the model's — the same _recompute_snapshot()
+    logic, just given trustworthy input. This is what actually closes
+    README Known Limitation #1 for the fields checked here: guardrails
+    already re-derived DECISIONS from model-reported inputs; this re-
+    derives the inputs themselves from a source the model never touches.
+
+    No-op (returns `recomputed` unchanged) when cfg.verify_inputs is False
+    or there's nothing to verify. Deliberately does not catch
+    mcp_client.MCPClientError — if verification is turned on and the
+    direct fetch itself fails, failing the cycle loudly is the fail-closed
+    behavior; silently falling back to unverified model input would defeat
+    the point of turning this on.
+    """
+    if not cfg.verify_inputs or not recomputed:
+        return recomputed
+
+    tickers = list(recomputed.keys())
+    fetched_quotes = fetch_quotes(cfg, tickers)
+
+    verified = dict(recomputed)
+    for ticker, entry in recomputed.items():
+        fetched = fetched_quotes.get(ticker)
+        if fetched is None:
+            continue
+
+        falsified_fields = [
+            field
+            for field in VERIFIED_QUOTE_FIELDS
+            if _quote_field_falsified(entry.get(field), fetched.get(field))
+        ]
+        if not falsified_fields:
+            continue
+
+        for field in falsified_fields:
+            print(
+                f"\n*** WARNING: {ticker} {field} does not match a direct "
+                f"fetch — model reported {entry.get(field)!r}, fetched "
+                f"{fetched.get(field)!r}. Using the fetched value. ***"
+            )
+            log_event(
+                cfg.log_file,
+                "input_falsified",
+                ticker=ticker,
+                field=field,
+                model_value=entry.get(field),
+                fetched_value=fetched.get(field),
+            )
+
+        recomputed_from_fetch = _recompute_snapshot(cfg, {ticker: _coerce_quote_price_fields(fetched)})
+        if ticker in recomputed_from_fetch:
+            verified[ticker] = recomputed_from_fetch[ticker]
+
+    return verified
 
 
 def _snapshot_diverges_from_model(entry: dict) -> bool:
@@ -365,10 +494,12 @@ def _log_market_snapshot(cfg: AgentConfig, text: str) -> dict[str, dict]:
 def _log_api_usage(cfg: AgentConfig, call: str, response) -> None:
     """Record token usage and an ESTIMATED dollar cost for one API call.
 
-    `call` names which step spent the tokens (proposal / execution /
-    reconciliation) so cost can be attributed rather than just totalled.
-    The dollar figure is derived from operator-supplied prices in
-    AgentConfig and is an estimate; the token counts are the ground truth.
+    `call` names which step spent the tokens (proposal / execution) so
+    cost can be attributed rather than just totalled. Reconciliation is no
+    longer an LLM call at all (see mcp_client.fetch_orders()), so it never
+    appears here. The dollar figure is derived from operator-supplied
+    prices in AgentConfig and is an estimate; the token counts are the
+    ground truth.
     """
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -406,17 +537,6 @@ def _log_api_usage(cfg: AgentConfig, call: str, response) -> None:
             fields[cache_field] = int(value)
 
     log_event(cfg.log_file, "api_usage", **fields)
-
-
-def _parse_order_records(text: str) -> tuple[list[dict], list[dict]]:
-    if "```json" not in text:
-        return [], []
-    try:
-        raw = text.split("```json")[1].split("```")[0]
-        data = json.loads(raw)
-        return data.get("equity_orders", []), data.get("option_orders", [])
-    except (json.JSONDecodeError, IndexError):
-        return [], []
 
 
 def confirm_with_human(prompt: str) -> bool:
@@ -492,37 +612,16 @@ def _execute_and_reconcile(
     )
 
     # Nothing above proves the model placed exactly (and only) the
-    # approved order — it has the full MCP toolset attached and was
-    # only told not to misuse it. Independently re-fetch what the
-    # broker actually recorded and reconcile in plain code.
-    reconcile_response = client.beta.messages.create(
-        model=cfg.model,
-        max_tokens=1500,
-        system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Fetch every order you just placed using the MCP "
-                    "tools get_equity_orders and get_option_orders "
-                    f"for account {cfg.agentic_account_number}, both "
-                    "filtered to placed_agent='agentic' and "
-                    f"created_at_gte='{execution_started_at}'. "
-                    "Return ONLY a JSON block fenced with ```json "
-                    "containing keys 'equity_orders' and "
-                    "'option_orders', each the raw list of order "
-                    "objects returned by the respective tool (empty "
-                    "list if none). No other text."
-                ),
-            }
-        ],
-        mcp_servers=_mcp_server_block(cfg),
-        tools=_mcp_toolset(RECONCILE_TOOLS),
-        betas=[MCP_BETA_HEADER],
-    )
-    _log_api_usage(cfg, "reconciliation", reconcile_response)
-    reconcile_text = _extract_text(reconcile_response)
-    equity_orders, option_orders = _parse_order_records(reconcile_text)
+    # approved order — it has the full MCP toolset attached and was only
+    # told not to misuse it. Independently re-fetch what the broker
+    # actually recorded — directly via mcp_client, no model in the loop —
+    # and reconcile in plain code. This used to be a second model-mediated
+    # MCP call (the same model that just executed was asked to also report
+    # what it did); replacing it with a direct fetch is what closes README
+    # Known Limitation #2.
+    orders = fetch_orders(cfg, cfg.agentic_account_number, execution_started_at)
+    equity_orders = [o for o in orders if o.get("instrument_type") == "equity"]
+    option_orders = [o for o in orders if o.get("instrument_type") == "option"]
     reconciliation = reconcile_order(order, equity_orders, option_orders)
 
     if not reconciliation.passed:
@@ -675,6 +774,13 @@ def run_cycle(cfg: AgentConfig, client: anthropic.Anthropic | None = None) -> st
     # Also recomputes day_change_pct in code from the raw quote fields —
     # never the model's own arithmetic.
     recomputed_snapshot = _log_market_snapshot(cfg, text)
+
+    # Independently fetch quotes directly from the MCP server (no model in
+    # the loop — see mcp_client.py) and compare against what the model
+    # reported. A mismatch beyond a small tolerance means the model's
+    # input was wrong or falsified; the fetched value replaces it here,
+    # before anything downstream ever sees the model's claim.
+    recomputed_snapshot = _verify_inputs_against_live_quotes(cfg, recomputed_snapshot)
 
     proposed = _parse_proposed_orders(text)
     # Every buy order's day_change_pct is overwritten here with the

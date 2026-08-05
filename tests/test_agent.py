@@ -25,9 +25,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent import (
     _execute_and_reconcile,
+    _quote_field_falsified,
     _recompute_snapshot,
     _session_prices_diverge,
     _snapshot_diverges_from_model,
+    _verify_inputs_against_live_quotes,
     run_cycle,
 )
 from config import AgentConfig
@@ -117,6 +119,11 @@ def _cfg(tmp_path, **overrides):
         mcp_url="https://example.invalid/mcp",
         robinhood_client_id="test-client-id",
         agentic_account_number="123456789",
+        # Off by default here so the many tests in this file that aren't
+        # about input verification don't need to mock fetch_quotes just to
+        # run run_cycle(). TestInputVerification turns it back on and
+        # mocks fetch_quotes explicitly.
+        verify_inputs=False,
     )
     defaults.update(overrides)
     return AgentConfig(**defaults)
@@ -174,9 +181,30 @@ def _read_log_events(log_file):
         return [json.loads(line) for line in f if line.strip()]
 
 
-def _reconcile_report(equity_orders, option_orders):
-    payload = {"equity_orders": equity_orders, "option_orders": option_orders}
-    return f"```json\n{json.dumps(payload)}\n```\n"
+def _fake_fetch_orders(records):
+    """Build a stand-in for mcp_client.fetch_orders() that returns a fixed
+    list of already-fetched order records regardless of args — reconcile()
+    is now fed directly-fetched data (see agent._execute_and_reconcile()),
+    not a model-mediated MCP call, so tests mock the fetch, not a second
+    client.beta.messages.create() response."""
+
+    def _fetch(cfg, account_number, since):
+        return records
+
+    return _fetch
+
+
+def _equity_order_record(symbol, side, dollar_amount):
+    return {
+        "symbol": symbol,
+        "side": side,
+        "dollar_amount": dollar_amount,
+        "instrument_type": "equity",
+    }
+
+
+def _option_order_record(**fields):
+    return {**fields, "instrument_type": "option"}
 
 
 def _enabled_tools(tools_kwarg):
@@ -450,6 +478,11 @@ class TestMcpToolRestriction:
         import agent as agent_module
 
         monkeypatch.setattr(agent_module, "confirm_with_human", lambda prompt: True)
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_orders",
+            _fake_fetch_orders([_equity_order_record("AAPL", "buy", 25.0)]),
+        )
 
         cfg = _cfg(tmp_path, dry_run=False, approval_mode=True)
         order = {
@@ -465,30 +498,37 @@ class TestMcpToolRestriction:
             [
                 _FakeResponse(_cycle_report([order])),
                 _FakeResponse("Order placed."),
-                _FakeResponse(
-                    _reconcile_report(
-                        [{"symbol": "AAPL", "side": "buy", "dollar_amount": 25.0}], []
-                    )
-                ),
             ]
         )
 
         run_cycle(cfg, client=client)
 
-        proposal_call, execution_call, reconcile_call = client.beta.messages.calls
+        proposal_call, execution_call = client.beta.messages.calls
 
         assert "place_equity_order" not in _enabled_tools(proposal_call["tools"])
         assert "place_equity_order" in _enabled_tools(execution_call["tools"])
-        assert "place_equity_order" not in _enabled_tools(reconcile_call["tools"])
 
-    def test_reconciliation_call_retains_get_option_orders(self, tmp_path, monkeypatch):
-        # get_option_orders exists precisely to catch an option order that
-        # shouldn't be there — reconciliation must keep access to it even
-        # though it never places anything.
+    def test_reconciliation_fetches_orders_directly_not_via_a_model_call(
+        self, tmp_path, monkeypatch
+    ):
+        # Reconciliation used to be a second model-mediated MCP call
+        # restricted to RECONCILE_TOOLS. It's now mcp_client.fetch_orders()
+        # — a direct HTTP fetch, no model, no toolset to restrict at all —
+        # which is strictly stronger: fetch_orders() always reads
+        # get_option_orders itself, structurally, rather than depending on
+        # a model being given (and choosing to use) the right tool.
         import agent as agent_module
 
         monkeypatch.setattr(agent_module, "confirm_with_human", lambda prompt: True)
 
+        captured_calls = []
+
+        def _spy_fetch_orders(cfg, account_number, since):
+            captured_calls.append((account_number, since))
+            return [_equity_order_record("AAPL", "buy", 25.0)]
+
+        monkeypatch.setattr(agent_module, "fetch_orders", _spy_fetch_orders)
+
         cfg = _cfg(tmp_path, dry_run=False, approval_mode=True)
         order = {
             "ticker": "AAPL",
@@ -503,22 +543,18 @@ class TestMcpToolRestriction:
             [
                 _FakeResponse(_cycle_report([order])),
                 _FakeResponse("Order placed."),
-                _FakeResponse(
-                    _reconcile_report(
-                        [{"symbol": "AAPL", "side": "buy", "dollar_amount": 25.0}], []
-                    )
-                ),
             ]
         )
 
         run_cycle(cfg, client=client)
 
-        reconcile_call = client.beta.messages.calls[2]
-        enabled = _enabled_tools(reconcile_call["tools"])
-
-        assert enabled == {"get_equity_orders", "get_option_orders"}
-        assert "place_equity_order" not in enabled
-        assert "place_option_order" not in enabled
+        # Only proposal + execution touched the model — no third
+        # "fetch what you just placed" call to reconcile with.
+        assert len(client.beta.messages.calls) == 2
+        assert len(captured_calls) == 1
+        account_number, since = captured_calls[0]
+        assert account_number == cfg.agentic_account_number
+        assert since  # a real execution-start timestamp was passed, not empty
 
 
 def _approved_buy_order():
@@ -562,17 +598,17 @@ class TestAutoApproveNoHumanInLoop:
             return real_validate_batch(cfg, orders, positions)
 
         monkeypatch.setattr(agent_module, "validate_batch", _spy)
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_orders",
+            _fake_fetch_orders([_equity_order_record("AAPL", "buy", 25.0)]),
+        )
 
         cfg = _cfg(tmp_path, approval_mode=False, dry_run=False)
         client = _FakeClient(
             [
                 _FakeResponse(_cycle_report([_approved_buy_order()])),
                 _FakeResponse("Order placed."),
-                _FakeResponse(
-                    _reconcile_report(
-                        [{"symbol": "AAPL", "side": "buy", "dollar_amount": 25.0}], []
-                    )
-                ),
             ]
         )
 
@@ -591,17 +627,17 @@ class TestAutoApproveNoHumanInLoop:
             )
 
         monkeypatch.setattr(agent_module, "confirm_with_human", _explode)
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_orders",
+            _fake_fetch_orders([_equity_order_record("AAPL", "buy", 25.0)]),
+        )
 
         cfg = _cfg(tmp_path, approval_mode=False, dry_run=False)
         client = _FakeClient(
             [
                 _FakeResponse(_cycle_report([_approved_buy_order()])),
                 _FakeResponse("Order placed."),
-                _FakeResponse(
-                    _reconcile_report(
-                        [{"symbol": "AAPL", "side": "buy", "dollar_amount": 25.0}], []
-                    )
-                ),
             ]
         )
 
@@ -636,23 +672,23 @@ class TestAutoApproveNoHumanInLoop:
         import agent as agent_module
 
         monkeypatch.setattr(agent_module, "confirm_with_human", lambda prompt: True)
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_orders",
+            _fake_fetch_orders([_equity_order_record("AAPL", "buy", 25.0)]),
+        )
 
         cfg = _cfg(tmp_path, approval_mode=False, dry_run=False)
         client = _FakeClient(
             [
                 _FakeResponse(_cycle_report([_approved_buy_order()])),
                 _FakeResponse("Order placed."),
-                _FakeResponse(
-                    _reconcile_report(
-                        [{"symbol": "AAPL", "side": "buy", "dollar_amount": 25.0}], []
-                    )
-                ),
             ]
         )
 
         run_cycle(cfg, client=client)
 
-        assert len(client.beta.messages.calls) == 3  # proposal, execute, reconcile
+        assert len(client.beta.messages.calls) == 2  # proposal, execute — no reconcile LLM call
         events = _read_log_events(cfg.log_file)
         assert any(e["event"] == "auto_approved" for e in events)
         assert any(e["event"] == "order_executed" for e in events)
@@ -810,6 +846,11 @@ class TestApiUsageLogging:
         import agent as agent_module
 
         monkeypatch.setattr(agent_module, "confirm_with_human", lambda prompt: True)
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_orders",
+            _fake_fetch_orders([_equity_order_record("AAPL", "buy", 25.0)]),
+        )
 
         cfg = _cfg(tmp_path, dry_run=False, approval_mode=True)
         client = _FakeClient(
@@ -822,20 +863,17 @@ class TestApiUsageLogging:
                     "Order placed.",
                     usage=_FakeUsage(input_tokens=2000, output_tokens=200),
                 ),
-                _FakeResponse(
-                    _reconcile_report(
-                        [{"symbol": "AAPL", "side": "buy", "dollar_amount": 25.0}], []
-                    ),
-                    usage=_FakeUsage(input_tokens=3000, output_tokens=300),
-                ),
             ]
         )
 
         run_cycle(cfg, client=client)
 
         usages = [e for e in _read_log_events(cfg.log_file) if e["event"] == "api_usage"]
-        assert [u["call"] for u in usages] == ["proposal", "execution", "reconciliation"]
-        assert [u["input_tokens"] for u in usages] == [1000, 2000, 3000]
+        # Reconciliation is no longer an LLM call at all — fetch_orders()
+        # costs an HTTP round trip, not tokens — so only two api_usage
+        # events are logged, not three.
+        assert [u["call"] for u in usages] == ["proposal", "execution"]
+        assert [u["input_tokens"] for u in usages] == [1000, 2000]
 
     def test_missing_usage_object_is_tolerated(self, tmp_path):
         # An SDK/mock without .usage must not crash a live trading cycle.
@@ -1061,3 +1099,233 @@ class TestSessionDivergenceLogging:
 
         events = _read_log_events(cfg.log_file)
         assert not any(e["event"] == "session_divergence" for e in events)
+
+
+class TestQuoteFieldFalsifiedHelper:
+    def test_within_tolerance_is_not_falsified(self):
+        # 0.3% apart — under INPUT_VERIFICATION_TOLERANCE_PCT (0.5%).
+        assert _quote_field_falsified(100.0, 100.3) is False
+
+    def test_beyond_tolerance_is_falsified(self):
+        assert _quote_field_falsified(100.0, 105.0) is True
+
+    def test_missing_model_value_is_not_falsified(self):
+        assert _quote_field_falsified(None, 100.0) is False
+
+    def test_missing_fetched_value_is_not_falsified(self):
+        assert _quote_field_falsified(100.0, None) is False
+
+    def test_string_values_are_compared_numerically(self):
+        # mcp_client.fetch_quotes() reports numeric fields as strings on
+        # the real API — this must not treat "same number, different type"
+        # as a falsification.
+        assert _quote_field_falsified("100.00", "100.10") is False
+        assert _quote_field_falsified("100.00", "600.00") is True
+
+
+class TestVerifyInputsAgainstLiveQuotes:
+    """_verify_inputs_against_live_quotes() unit-tested directly, the same
+    way _recompute_snapshot() is — full run_cycle() coverage of this same
+    mechanism (including the guardrail-rejection consequence of a
+    falsified field) lives in test_prompt_injection.py's
+    TestInputFalsificationIsDetected.
+    """
+
+    def test_verify_inputs_false_is_a_no_op(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        def _explode(cfg, symbols):
+            raise AssertionError("fetch_quotes must not be called when verify_inputs=False")
+
+        monkeypatch.setattr(agent_module, "fetch_quotes", _explode)
+
+        cfg = _cfg(tmp_path, verify_inputs=False)
+        recomputed = {"AAPL": {"current_price": 100.0, "day_change_pct": -5.0}}
+
+        assert _verify_inputs_against_live_quotes(cfg, recomputed) == recomputed
+
+    def test_empty_recomputed_is_a_no_op(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        def _explode(cfg, symbols):
+            raise AssertionError("fetch_quotes must not be called with nothing to verify")
+
+        monkeypatch.setattr(agent_module, "fetch_quotes", _explode)
+
+        cfg = _cfg(tmp_path, verify_inputs=True)
+
+        assert _verify_inputs_against_live_quotes(cfg, {}) == {}
+
+    def test_matching_quote_logs_no_input_falsified_event(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_quotes",
+            lambda cfg, symbols: {
+                "AAPL": {
+                    "last_trade_price": "92.00",
+                    "last_non_reg_trade_price": None,
+                    "adjusted_previous_close": "100.00",
+                }
+            },
+        )
+
+        cfg = _cfg(tmp_path, verify_inputs=True)
+        recomputed = {
+            "AAPL": {
+                "current_price": 92.0,
+                "day_change_pct": -8.0,
+                "last_trade_price": 92.0,
+                "last_non_reg_trade_price": None,
+                "adjusted_previous_close": 100.0,
+            }
+        }
+
+        result = _verify_inputs_against_live_quotes(cfg, recomputed)
+
+        assert result == recomputed
+        # Nothing was logged at all — no falsification means log_event()
+        # is never called, so the file doesn't even exist yet.
+        assert not os.path.exists(cfg.log_file)
+
+    def test_falsified_field_is_logged_and_the_fetched_value_wins(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_quotes",
+            lambda cfg, symbols: {
+                "AAPL": {
+                    "last_trade_price": "310.29",
+                    "last_non_reg_trade_price": None,
+                    "adjusted_previous_close": "313.00",  # the REAL close
+                }
+            },
+        )
+
+        cfg = _cfg(tmp_path, verify_inputs=True)
+        recomputed = {
+            "AAPL": {
+                "current_price": 310.29,
+                "day_change_pct": -48.28,  # the fake dip
+                "last_trade_price": 310.29,
+                "last_non_reg_trade_price": None,
+                "adjusted_previous_close": 600.00,  # the LIE
+            }
+        }
+
+        result = _verify_inputs_against_live_quotes(cfg, recomputed)
+
+        events = _read_log_events(cfg.log_file)
+        falsified = [e for e in events if e["event"] == "input_falsified"]
+        assert len(falsified) == 1
+        assert falsified[0]["ticker"] == "AAPL"
+        assert falsified[0]["field"] == "adjusted_previous_close"
+        assert falsified[0]["model_value"] == 600.00
+        assert falsified[0]["fetched_value"] == "313.00"
+
+        # Corrected entry reflects the real, tiny move, not the fake dip.
+        assert result["AAPL"]["day_change_pct"] == pytest.approx(
+            (310.29 - 313.00) / 313.00 * 100
+        )
+
+    def test_ticker_with_no_fetched_quote_is_left_unverified(self, tmp_path, monkeypatch):
+        # fetch_quotes() didn't return anything for this ticker (e.g. a
+        # transient gap) — nothing to compare against, so the model's
+        # value passes through unchanged rather than being flagged either
+        # way.
+        import agent as agent_module
+
+        monkeypatch.setattr(agent_module, "fetch_quotes", lambda cfg, symbols: {})
+
+        cfg = _cfg(tmp_path, verify_inputs=True)
+        recomputed = {"AAPL": {"current_price": 92.0, "day_change_pct": -8.0}}
+
+        result = _verify_inputs_against_live_quotes(cfg, recomputed)
+
+        assert result == recomputed
+        assert not os.path.exists(cfg.log_file)
+
+
+class TestReconciliationAgainstDirectlyFetchedOrders:
+    """The model-mediated reconcile call is gone; reconcile_order() —
+    deliberately left unchanged — is now fed by mcp_client.fetch_orders()
+    directly. These confirm it still catches what it always caught,
+    against the new data source."""
+
+    def test_matching_fetched_order_is_verified(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        monkeypatch.setattr(agent_module, "confirm_with_human", lambda prompt: True)
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_orders",
+            _fake_fetch_orders([_equity_order_record("AAPL", "buy", 25.0)]),
+        )
+
+        cfg = _cfg(tmp_path, dry_run=False, approval_mode=True)
+        client = _FakeClient(
+            [_FakeResponse(_cycle_report([_approved_buy_order()])), _FakeResponse("Order placed.")]
+        )
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        assert any(e["event"] == "execution_verified" for e in events)
+        assert not any(e["event"] == "execution_mismatch" for e in events)
+
+    def test_option_order_in_fetched_data_causes_a_mismatch(self, tmp_path, monkeypatch):
+        # This strategy is equities-only — an option order among the
+        # directly-fetched records is itself the violation, exactly like
+        # it was under the old model-mediated reconcile call.
+        import agent as agent_module
+
+        monkeypatch.setattr(agent_module, "confirm_with_human", lambda prompt: True)
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_orders",
+            _fake_fetch_orders(
+                [
+                    _equity_order_record("AAPL", "buy", 25.0),
+                    _option_order_record(chain_symbol="AAPL", state="filled"),
+                ]
+            ),
+        )
+
+        cfg = _cfg(tmp_path, dry_run=False, approval_mode=True)
+        client = _FakeClient(
+            [_FakeResponse(_cycle_report([_approved_buy_order()])), _FakeResponse("Order placed.")]
+        )
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        mismatches = [e for e in events if e["event"] == "execution_mismatch"]
+        assert len(mismatches) == 1
+        assert "option order" in mismatches[0]["reason"]
+        assert not any(e["event"] == "execution_verified" for e in events)
+
+    def test_dollar_amount_mismatch_in_fetched_order_causes_a_mismatch(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        monkeypatch.setattr(agent_module, "confirm_with_human", lambda prompt: True)
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_orders",
+            # Approved $25.00, broker actually recorded $50.00 — over the
+            # 1% reconciliation tolerance.
+            _fake_fetch_orders([_equity_order_record("AAPL", "buy", 50.0)]),
+        )
+
+        cfg = _cfg(tmp_path, dry_run=False, approval_mode=True)
+        client = _FakeClient(
+            [_FakeResponse(_cycle_report([_approved_buy_order()])), _FakeResponse("Order placed.")]
+        )
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        mismatches = [e for e in events if e["event"] == "execution_mismatch"]
+        assert len(mismatches) == 1
+        assert "dollar amount mismatch" in mismatches[0]["reason"]

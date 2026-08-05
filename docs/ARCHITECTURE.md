@@ -58,8 +58,11 @@ Claude (READ_ONLY_TOOLS) ◀──▶ Robinhood MCP     1. PROPOSE
 Claude (EXECUTION_TOOLS) ────▶ Robinhood MCP    4. EXECUTE
               │
               ▼
-   reconcile.py (RECONCILE_TOOLS)   re-fetch the broker's own order
-              │                     records, compare to what was approved
+   mcp_client.fetch_orders()     direct HTTP re-fetch of the broker's own
+              │                  order records — no model in the loop
+              ▼
+   reconcile.reconcile_order()   pure comparison against what was approved
+              │
               ▼
    logging_utils → trade_log.jsonl → build_dashboard.py
 ```
@@ -92,9 +95,15 @@ allowlist passed as an `mcp_toolset` entry:
 - `READ_ONLY_TOOLS` — quotes, positions, account, historicals, tax lots.
   Used for every proposal call and the entire `dry_run` path.
 - `EXECUTION_TOOLS` — `READ_ONLY_TOOLS` plus `place_equity_order`, used
-  **only** inside `_execute_and_reconcile()`.
-- `RECONCILE_TOOLS` — order-record lookups only; reconciliation can't
-  notice an order it isn't allowed to fetch.
+  **only** inside `_execute_and_reconcile()`, for the one call that places
+  the order.
+
+Reconciliation used to be a second model-mediated MCP call restricted to
+its own allowlist (`RECONCILE_TOOLS`, now removed). It's
+`mcp_client.fetch_orders()` instead — a direct HTTP call with no model and
+no toolset to restrict, which is strictly stronger: it always reads
+`get_option_orders` itself rather than depending on a model being given,
+and choosing to use, the right tool.
 
 A proposal or dry-run call has no `place_equity_order` tool attached — the
 model could not call it even if adversarial tool output talked it into
@@ -190,20 +199,29 @@ that the configured session correctly ignored.
 
 Three tiers of "how much is this trusted":
 
-- **What the model supplies and code re-derives.** `day_change_pct`,
-  `positions`, and raw quote fields all come from the model, but every
-  number that gates a trade is re-derived from those inputs in plain
-  Python before a decision is made. The model's *inputs* are still
-  trusted; its *arithmetic* on them is not.
+- **What the model supplies and code re-derives.** `positions`, `avg_cost`,
+  and `days_held` come from the model, and every number that gates a trade
+  is re-derived from those inputs in plain Python before a decision is
+  made — but the inputs themselves are still trusted. Raw quote fields
+  (`last_trade_price`, `last_non_reg_trade_price`, `adjusted_previous_close`)
+  are the one exception: with `AgentConfig.verify_inputs=True` (default),
+  `mcp_client.fetch_quotes()` independently re-fetches them, and a
+  mismatch beyond a small tolerance uses the fetched value — never the
+  model's (`agent._verify_inputs_against_live_quotes()`). Everything else
+  the model supplies for a decision is still trusted as input, even though
+  the arithmetic performed on it never is.
 - **What is structurally unreachable, not just discouraged.** Order
   placement during proposal/dry-run, and any tool outside a call's
   allowlist. No prompt wording is load-bearing here.
-- **What remains model-mediated.** Reconciliation asks the same model
-  that just executed to report what it did, then verifies that report in
-  code — catching accidental failures (tool errors, confused models,
-  duplicate fills), but not a sufficiently adversarial actor controlling
-  both the execution and the reconciliation read. The most honest
-  remaining trust boundary here.
+- **What remains model-mediated.** Only order *execution* itself — placing
+  the order via `place_equity_order` — still requires the model, because
+  `mcp_client.py` is deliberately incapable of trading (see its module
+  docstring). Reconciliation used to share this tier (the same model that
+  executed was asked, in a second call, to report what it did) but no
+  longer does: `mcp_client.fetch_orders()` re-fetches the broker's own
+  order records directly, with no model in the loop, so a sufficiently
+  adversarial actor controlling the executing call no longer also controls
+  the check on it.
 
 For the current, dated state of what's verified against the live server
 versus still simulated or mocked, see the README's **Known limitations**

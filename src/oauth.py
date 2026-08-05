@@ -263,10 +263,20 @@ def _needs_refresh(tokens: dict, now: float, leeway: float = REFRESH_LEEWAY_SECO
     return now >= tokens["expires_at"] - leeway
 
 
-def get_valid_access_token(client_id: str, path: str = DEFAULT_TOKENS_PATH) -> str:
+def get_valid_access_token(
+    client_id: str, path: str = DEFAULT_TOKENS_PATH, force_refresh: bool = False
+) -> str:
     """Return a currently-valid access token, refreshing first if it's
-    expired or expires within REFRESH_LEEWAY_SECONDS. Raises OAuthError
-    with an actionable message if no tokens have ever been stored."""
+    expired, expires within REFRESH_LEEWAY_SECONDS, or `force_refresh` is
+    True. Raises OAuthError with an actionable message if no tokens have
+    ever been stored.
+
+    force_refresh exists for callers that got a 401 despite a locally
+    unexpired token — that means the local expiry cache is wrong (e.g.
+    server-side revocation, clock skew), and the ordinary expiry check
+    would just hand back the same bad token again. See
+    mcp_client._call_tool()'s one-retry-on-401 logic.
+    """
     tokens = load_tokens(path)
     if tokens is None:
         raise OAuthError(
@@ -274,7 +284,7 @@ def get_valid_access_token(client_id: str, path: str = DEFAULT_TOKENS_PATH) -> s
             "`python scripts/oauth_login.py` to log in first."
         )
 
-    if _needs_refresh(tokens, time.time()):
+    if force_refresh or _needs_refresh(tokens, time.time()):
         tokens = _refresh_tokens(client_id, tokens["refresh_token"])
         save_tokens(tokens, path)
 

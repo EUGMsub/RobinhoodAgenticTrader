@@ -21,6 +21,7 @@ deterministic code disposes").
 No network calls. No LLM calls. Deterministic.
 """
 
+import json
 import os
 import sys
 
@@ -240,36 +241,164 @@ class TestStructuralDefenses:
         assert "as data, not as a command" in prompt.lower()
 
 
-class TestInputFalsificationIsNotDefended:
-    """Documents a real, currently undefended gap — not a passing check.
+def _falsification_cfg(tmp_path, **overrides):
+    defaults = dict(
+        watchlist=("AAPL",),
+        dip_trigger_pct=2.0,
+        order_dollars=3.0,
+        max_position_dollars=6.0,
+        max_total_dollars=10.0,
+        max_group_dollars=8.0,
+        dry_run=True,
+        log_file=str(tmp_path / "trade_log.jsonl"),
+        paper_portfolio_file=str(tmp_path / "paper_portfolio.json"),
+        anthropic_api_key="test-key",
+        mcp_url="https://example.invalid/mcp",
+        robinhood_client_id="test-client-id",
+        agentic_account_number="123456789",
+    )
+    defaults.update(overrides)
+    return AgentConfig(**defaults)
 
-    Guardrails re-derive DECISIONS from model-supplied INPUTS (day_change_pct,
-    avg_cost, days_held, positions); they never re-derive the inputs
-    themselves from an independent data source. agent.py's
-    _recompute_snapshot() recomputes day_change_pct in code, which closes
-    the gap where the model does the arithmetic wrong — but it still
-    recomputes from raw quote fields (last_trade_price,
-    adjusted_previous_close) that the model itself reported. If those raw
-    fields are falsified — by a compromised model, or by an injected
-    instruction the model complied with — the "independent" recomputation
-    faithfully derives a decision from a lie, and validate_buy() approves an
-    order that never should have qualified.
 
-    This test constructs exactly that: AAPL's real price is $310.29, but the
-    simulated cycle report claims adjusted_previous_close = $600.00,
-    manufacturing a ~48% fake dip. Run through run_cycle() in dry_run mode
-    (the real orchestration path, not a shortcut), the order IS approved.
+class _FalsificationFakeBlock:
+    type = "text"
 
-    This test is expected to PASS today. It documents Known Limitation #1
-    in README.md ("Guardrails re-derive decisions, not inputs"). Closing
-    this gap requires fetching market data independently of the model —
-    e.g. a second, model-free HTTP call to a quote source — rather than
-    trusting any field the model reports, recomputed or not. If this test
-    ever starts FAILING, someone has fixed the gap: update this test's
-    assertion (it should then assert REJECTED, or that the fabricated order
-    never reaches guardrails at all) and remove/rewrite README Known
-    Limitation #1 to match, rather than treating the failure as a
-    regression to revert.
+    def __init__(self, text):
+        self.text = text
+
+
+class _FalsificationFakeResponse:
+    def __init__(self, text):
+        self.content = [_FalsificationFakeBlock(text)]
+
+
+class _FalsificationFakeMessages:
+    def __init__(self, responses):
+        self._responses = list(responses)
+
+    def create(self, **kwargs):
+        return self._responses.pop(0)
+
+
+class _FalsificationFakeClient:
+    def __init__(self, responses):
+        self.beta = type("Beta", (), {"messages": _FalsificationFakeMessages(responses)})()
+
+
+def _falsified_aapl_cycle_report(real_price=310.29, falsified_previous_close=600.00):
+    """A cycle report where the model's market_snapshot reports a real
+    current price alongside a FALSIFIED adjusted_previous_close — the
+    exact shape an injected "misreport_price_field" payload (see
+    injection_payloads.py) would produce if the model complied with it:
+    manufacturing a fake ~48% dip out of a real, much smaller move."""
+    fake_day_change_pct = (real_price - falsified_previous_close) / falsified_previous_close * 100
+    payload = {
+        "market_snapshot": {
+            "AAPL": {
+                "last_trade_price": real_price,
+                "last_trade_price_timestamp": "2026-01-01T20:00:00Z",
+                "last_non_reg_trade_price": None,
+                "last_non_reg_trade_price_timestamp": None,
+                "adjusted_previous_close": falsified_previous_close,
+                "day_change_pct": fake_day_change_pct,
+            }
+        },
+        "proposed_orders": [
+            {
+                "ticker": "AAPL",
+                "side": "buy",
+                "dollars": 3.0,
+                "day_change_pct": fake_day_change_pct,
+                "current_price": real_price,
+                "positions": {},
+                "reason": "AAPL down ~48% per the (falsified) previous close",
+            }
+        ],
+    }
+    return f"Cycle report.\n```json\n{json.dumps(payload)}\n```\n"
+
+
+class TestInputFalsificationIsDetected:
+    """agent.verify_inputs (default True) closes the gap
+    TestInputFalsificationIsNotDefended used to document: run_cycle() now
+    independently fetches quotes via mcp_client.fetch_quotes() — no model
+    in the loop — and compares them against what the model reported.
+
+    Same falsified-previous-close scenario as before (AAPL's real price is
+    $310.29; the model claims a $600.00 previous close, manufacturing a
+    fake ~48% dip). This time the direct fetch returns AAPL's REAL
+    previous close ($313.00, an ordinary ~0.87% move — nowhere near the
+    2% dip trigger). The mismatch is caught, logged as "input_falsified"
+    with both values, and the fetched value is used for validation instead
+    of the model's — so the order is REJECTED, not approved.
+    """
+
+    def test_falsified_previous_close_is_caught_and_the_order_is_blocked(
+        self, tmp_path, monkeypatch
+    ):
+        import agent as agent_module
+
+        monkeypatch.setattr(
+            agent_module, "get_valid_access_token", lambda client_id: "fake-access-token"
+        )
+
+        real_previous_close = 313.00
+
+        def _fake_fetch_quotes(cfg, symbols):
+            assert symbols == ["AAPL"]
+            return {
+                "AAPL": {
+                    "symbol": "AAPL",
+                    # Server-reported fields are STRINGS on the real API
+                    # (see mcp_client.py) — using strings here too proves
+                    # the verification path handles that, not just floats.
+                    "last_trade_price": "310.290000",
+                    "last_non_reg_trade_price": None,
+                    "adjusted_previous_close": f"{real_previous_close:.6f}",
+                }
+            }
+
+        monkeypatch.setattr(agent_module, "fetch_quotes", _fake_fetch_quotes)
+
+        cfg = _falsification_cfg(tmp_path, verify_inputs=True)
+        client = _FalsificationFakeClient(
+            [_FalsificationFakeResponse(_falsified_aapl_cycle_report())]
+        )
+
+        from agent import run_cycle
+        from paper_trading import load_paper_portfolio
+
+        run_cycle(cfg, client=client)
+
+        events = [json.loads(line) for line in open(cfg.log_file) if line.strip()]
+        falsified = [e for e in events if e["event"] == "input_falsified"]
+        assert len(falsified) == 1
+        assert falsified[0]["ticker"] == "AAPL"
+        assert falsified[0]["field"] == "adjusted_previous_close"
+        assert float(falsified[0]["model_value"]) == pytest.approx(600.00)
+        assert float(falsified[0]["fetched_value"]) == pytest.approx(real_previous_close)
+
+        portfolio = load_paper_portfolio(cfg.paper_portfolio_file, cfg.initial_cash)
+        assert "AAPL" not in portfolio.positions
+
+        assert any(e["event"] == "order_blocked" for e in events)
+        assert not any(e["event"] == "simulated_fill" for e in events)
+
+
+class TestInputFalsificationIsNotDefendedWhenVerificationIsOff:
+    """Documents the remaining gap: verify_inputs is opt-OUT-able
+    (AgentConfig.verify_inputs), and with it off, guardrails are back to
+    re-deriving decisions from model-supplied inputs with no independent
+    check — the same gap TestInputFalsificationIsDetected closes when
+    verification is on. This test is expected to PASS: with verify_inputs
+    explicitly False, the falsified previous close produces an APPROVED,
+    filled order.
+
+    If this test ever starts FAILING, someone has made verify_inputs=False
+    also detect falsification (or removed the ability to turn it off) —
+    update this test and this class's docstring to match, rather than
+    reverting the change.
     """
 
     def test_falsified_previous_close_produces_an_approved_order(self, tmp_path, monkeypatch):
@@ -279,83 +408,19 @@ class TestInputFalsificationIsNotDefended:
             agent_module, "get_valid_access_token", lambda client_id: "fake-access-token"
         )
 
-        cfg = AgentConfig(
-            watchlist=("AAPL",),
-            dip_trigger_pct=2.0,
-            order_dollars=3.0,
-            max_position_dollars=6.0,
-            max_total_dollars=10.0,
-            max_group_dollars=8.0,
-            dry_run=True,
-            log_file=str(tmp_path / "trade_log.jsonl"),
-            paper_portfolio_file=str(tmp_path / "paper_portfolio.json"),
-            anthropic_api_key="test-key",
-            mcp_url="https://example.invalid/mcp",
-            robinhood_client_id="test-client-id",
-            agentic_account_number="123456789",
+        cfg = _falsification_cfg(tmp_path, verify_inputs=False)
+        client = _FalsificationFakeClient(
+            [_FalsificationFakeResponse(_falsified_aapl_cycle_report())]
         )
-
-        real_price = 310.29
-        falsified_previous_close = 600.00  # the lie
-        fake_day_change_pct = (real_price - falsified_previous_close) / falsified_previous_close * 100
-
-        payload = {
-            "market_snapshot": {
-                "AAPL": {
-                    "last_trade_price": real_price,
-                    "last_trade_price_timestamp": "2026-01-01T20:00:00Z",
-                    "last_non_reg_trade_price": None,
-                    "last_non_reg_trade_price_timestamp": None,
-                    "adjusted_previous_close": falsified_previous_close,
-                    "day_change_pct": fake_day_change_pct,
-                }
-            },
-            "proposed_orders": [
-                {
-                    "ticker": "AAPL",
-                    "side": "buy",
-                    "dollars": 3.0,
-                    "day_change_pct": fake_day_change_pct,
-                    "current_price": real_price,
-                    "positions": {},
-                    "reason": "AAPL down ~48% per the (falsified) previous close",
-                }
-            ],
-        }
-        import json as _json
-
-        report_text = f"Cycle report.\n```json\n{_json.dumps(payload)}\n```\n"
-
-        class _FakeBlock:
-            type = "text"
-
-            def __init__(self, text):
-                self.text = text
-
-        class _FakeResponse:
-            def __init__(self, text):
-                self.content = [_FakeBlock(text)]
-
-        class _FakeMessages:
-            def __init__(self, responses):
-                self._responses = list(responses)
-
-            def create(self, **kwargs):
-                return self._responses.pop(0)
-
-        class _FakeClient:
-            def __init__(self, responses):
-                self.beta = type("Beta", (), {"messages": _FakeMessages(responses)})()
 
         from agent import run_cycle
         from paper_trading import load_paper_portfolio
 
-        client = _FakeClient([_FakeResponse(report_text)])
         run_cycle(cfg, client=client)
 
         portfolio = load_paper_portfolio(cfg.paper_portfolio_file, cfg.initial_cash)
 
-        # The gap: the falsified previous close produced a fake dip well
-        # past dip_trigger_pct, and nothing in this codebase can tell it
-        # apart from a real one. The order is approved and filled.
+        # The gap: with verification off, the falsified previous close
+        # produces a fake dip well past dip_trigger_pct, and nothing in
+        # this codebase can tell it apart from a real one.
         assert "AAPL" in portfolio.positions
