@@ -316,6 +316,17 @@ def _verify_inputs_against_live_quotes(
     already re-derived DECISIONS from model-reported inputs; this re-
     derives the inputs themselves from a source the model never touches.
 
+    Also carries mcp_client.fetch_quotes()'s stale_previous_close flag (see
+    that module's _is_stale_previous_close) onto a ticker's entry when set
+    — the model's own market_snapshot never reports the raw fields that
+    flag is computed from, so this direct fetch is the only place it can
+    be detected. The caller (run_cycle) reads it to skip proposing buys
+    for that ticker; see _stale_previous_close_tickers() /
+    _drop_buys_for_stale_tickers(). The key is only ever added, never set
+    to False, so a ticker that was never checked (verify_inputs off, or no
+    fetched quote) is indistinguishable from one confirmed not-stale —
+    both simply lack the key.
+
     No-op (returns `recomputed` unchanged) when cfg.verify_inputs is False
     or there's nothing to verify. Deliberately does not catch
     mcp_client.MCPClientError — if verification is turned on and the
@@ -340,29 +351,76 @@ def _verify_inputs_against_live_quotes(
             for field in VERIFIED_QUOTE_FIELDS
             if _quote_field_falsified(entry.get(field), fetched.get(field))
         ]
-        if not falsified_fields:
-            continue
+        if falsified_fields:
+            for field in falsified_fields:
+                print(
+                    f"\n*** WARNING: {ticker} {field} does not match a direct "
+                    f"fetch — model reported {entry.get(field)!r}, fetched "
+                    f"{fetched.get(field)!r}. Using the fetched value. ***"
+                )
+                log_event(
+                    cfg.log_file,
+                    "input_falsified",
+                    ticker=ticker,
+                    field=field,
+                    model_value=entry.get(field),
+                    fetched_value=fetched.get(field),
+                )
 
-        for field in falsified_fields:
-            print(
-                f"\n*** WARNING: {ticker} {field} does not match a direct "
-                f"fetch — model reported {entry.get(field)!r}, fetched "
-                f"{fetched.get(field)!r}. Using the fetched value. ***"
-            )
-            log_event(
-                cfg.log_file,
-                "input_falsified",
-                ticker=ticker,
-                field=field,
-                model_value=entry.get(field),
-                fetched_value=fetched.get(field),
-            )
+            recomputed_from_fetch = _recompute_snapshot(cfg, {ticker: _coerce_quote_price_fields(fetched)})
+            if ticker in recomputed_from_fetch:
+                verified[ticker] = recomputed_from_fetch[ticker]
 
-        recomputed_from_fetch = _recompute_snapshot(cfg, {ticker: _coerce_quote_price_fields(fetched)})
-        if ticker in recomputed_from_fetch:
-            verified[ticker] = recomputed_from_fetch[ticker]
+        if fetched.get("stale_previous_close"):
+            entry_for_ticker = dict(verified.get(ticker, entry))
+            entry_for_ticker["stale_previous_close"] = True
+            verified[ticker] = entry_for_ticker
 
     return verified
+
+
+def _stale_previous_close_tickers(recomputed: dict[str, dict]) -> list[str]:
+    """Tickers whose entry carries a stale_previous_close flag (set by
+    _verify_inputs_against_live_quotes() from mcp_client.fetch_quotes(),
+    which is the only source that has previous_close_date/
+    venue_last_trade_time to detect this from — the model's own
+    market_snapshot never reports them). Deterministic order: iteration
+    order of `recomputed`, which is insertion order."""
+    return [ticker for ticker, entry in recomputed.items() if entry.get("stale_previous_close")]
+
+
+def _log_stale_previous_close(cfg: AgentConfig, stale_tickers: list[str]) -> None:
+    """Print and log a warning for every ticker whose adjusted_previous_close
+    has rolled forward to today's own close (see mcp_client.py's
+    _is_stale_previous_close) — a day_change_pct computed against it reads
+    a spurious 0.00%, which is missing data, not a real "no move" signal.
+    No-op when `stale_tickers` is empty."""
+    if not stale_tickers:
+        return
+    print(
+        "\n*** WARNING: stale previous close for "
+        f"{', '.join(stale_tickers)} — adjusted_previous_close has rolled "
+        "forward to today's own close, so day_change_pct would read a "
+        "spurious 0.00%. Skipping buy proposals for these tickers. ***"
+    )
+    log_event(cfg.log_file, "stale_previous_close", tickers=stale_tickers)
+
+
+def _drop_buys_for_stale_tickers(orders: list[dict], stale_tickers: list[str]) -> list[dict]:
+    """Remove buy proposals for any ticker in `stale_tickers` before they
+    ever reach validate_batch() — a 0.00% day change from a rolled-forward
+    previous close is missing data, not a real signal, so it must not be
+    evaluated against the dip trigger at all. Sells are left alone: they
+    don't depend on day_change_pct."""
+    stale = set(stale_tickers)
+    return [
+        order
+        for order in orders
+        if not (
+            order.get("side") == "buy"
+            and str(order.get("ticker", "")).upper().strip() in stale
+        )
+    ]
 
 
 def _snapshot_diverges_from_model(entry: dict) -> bool:
@@ -782,12 +840,20 @@ def run_cycle(cfg: AgentConfig, client: anthropic.Anthropic | None = None) -> st
     # before anything downstream ever sees the model's claim.
     recomputed_snapshot = _verify_inputs_against_live_quotes(cfg, recomputed_snapshot)
 
+    # A stale_previous_close ticker's day_change_pct is not a real "no
+    # move" signal — it's a rolled-forward previous close reading a
+    # spurious 0.00%. Buys for that ticker are dropped before validation
+    # ever sees them, regardless of dry_run/live/approval_mode.
+    stale_tickers = _stale_previous_close_tickers(recomputed_snapshot)
+    _log_stale_previous_close(cfg, stale_tickers)
+
     proposed = _parse_proposed_orders(text)
     # Every buy order's day_change_pct is overwritten here with the
     # code-recomputed value for its ticker before it ever reaches
     # validate_batch() — this is the actual fix for the missed after-hours
     # move: whatever the model put in the order is not what guardrails see.
     _apply_recomputed_day_change_pct(proposed, recomputed_snapshot)
+    proposed = _drop_buys_for_stale_tickers(proposed, stale_tickers)
     if not proposed:
         return text
 

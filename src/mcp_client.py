@@ -42,11 +42,21 @@ assumed from a generic MCP client:
     amounts) come back as quoted STRINGS ("309.380000"), not JSON numbers.
     Every function here casts explicitly rather than trusting `float()` to
     be a no-op.
-  - Each fetch_* call opens its own short-lived session (initialize ->
-    notifications/initialized -> tools/call) instead of caching a session
-    across calls. Simpler and more robust than session-lifetime management
-    for a client that runs a handful of times per day; the extra two round
-    trips are immaterial at this call volume.
+  - A session (session id + negotiated protocol version) is opened lazily
+    — on the first tool call, not at import time — and cached per
+    `mcp_url` in `_SESSION_CACHE`, so a fetch_positions() call (which
+    internally also calls fetch_quotes()) does the initialize +
+    notifications/initialized handshake once, not once per tool call. If a
+    tool call fails because the server has forgotten the session (observed
+    on this transport as an HTTP 404 — the session id it was given no
+    longer exists server-side, e.g. after a restart or a long idle gap),
+    the cached session is dropped and re-opened exactly once, and the tool
+    call retried; a second failure of the same kind fails loudly rather
+    than looping.
+  - A 401 gets the same one-retry treatment via a different repair: force
+    a token refresh (oauth.get_valid_access_token(..., force_refresh=True))
+    and re-open the session with the new token, then retry once. A second
+    401 fails loudly.
   - List endpoints (get_equity_orders, get_option_orders, and — per the
     same tool family's documented shape — get_equity_positions) paginate
     via a `data.next` URL, empty when there are no more pages. This module
@@ -139,10 +149,33 @@ def _post(
         raise _HTTPStatusError(e.code, detail) from e
 
 
-def _open_session(mcp_url: str, token: str) -> tuple[str | None, str | None]:
-    """Run initialize + notifications/initialized. Returns (session_id,
-    negotiated_protocol_version) — either may be None if the server didn't
-    provide one, though the live server always has so far."""
+class _Session:
+    """A session id + negotiated protocol version from one initialize
+    handshake, cached and reused across tool calls until something
+    invalidates it. `__slots__` because this project's convention is to
+    prefer real types over untyped tuples/dicts for anything passed
+    between functions."""
+
+    __slots__ = ("session_id", "protocol_version")
+
+    def __init__(self, session_id: str | None, protocol_version: str | None):
+        self.session_id = session_id
+        self.protocol_version = protocol_version
+
+
+# Keyed by mcp_url — this module has no client object to hang session state
+# off of, and every public function takes `cfg` fresh, so a module-level
+# cache is where a lazily-opened, reused session actually lives. Tests
+# reset this between cases (see tests/test_mcp_client.py's autouse
+# fixture) since it would otherwise leak state across tests that all use
+# the same fake mcp_url.
+_SESSION_CACHE: dict[str, _Session] = {}
+
+
+def _open_session(mcp_url: str, token: str) -> _Session:
+    """Run initialize + notifications/initialized and return the resulting
+    _Session. Does NOT touch _SESSION_CACHE — callers decide when a freshly
+    opened session replaces a cached one."""
     init_payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -168,44 +201,75 @@ def _open_session(mcp_url: str, token: str) -> tuple[str | None, str | None]:
         session_id=session_id,
         protocol_version=negotiated_version,
     )
-    return session_id, negotiated_version
+    return _Session(session_id, negotiated_version)
+
+
+def _is_session_error(e: _HTTPStatusError) -> bool:
+    # The MCP Streamable HTTP transport's documented signal for "this
+    # session id no longer exists server-side" is a 404 on a request that
+    # carried Mcp-Session-Id. Never observed against the live server yet
+    # (every session used so far has been short-lived), but this is the
+    # correct response to plan for structurally rather than only after
+    # hitting it in production.
+    return e.status == 404
 
 
 def _call_tool(cfg: AgentConfig, tool_name: str, arguments: dict) -> dict:
-    """Open a fresh session and call exactly one tool. On a 401, refresh
-    the access token once (force_refresh=True bypasses the "not expired
-    yet" cache check — a 401 despite a locally-unexpired token means the
-    cache is wrong, e.g. server-side revocation) and retry exactly once;
-    any other failure, or a second 401, fails loudly.
+    """Call exactly one tool, using a lazily-opened session cached per
+    mcp_url (see _SESSION_CACHE) rather than re-handshaking every call.
+
+    Two failure modes each get exactly one repair-and-retry, never more:
+      - A session error (see _is_session_error) drops the cached session
+        and opens a fresh one with the same token, then retries once.
+      - A 401 forces a token refresh (the locally-cached token being
+        treated as valid was wrong — e.g. server-side revocation) and
+        opens a fresh session with the new token, then retries once.
+    Any other failure, or a second failure of either kind, fails loudly.
 
     `tool_name` is always a literal passed by one of this module's three
     public functions — never a caller-supplied value. That is what makes
     "no order-placing capability" a structural property of this module
     rather than a convention someone could bypass.
     """
-    last_401: _HTTPStatusError | None = None
+    call_payload = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments},
+    }
 
-    for attempt in (1, 2):
-        token = get_valid_access_token(cfg.robinhood_client_id, force_refresh=(attempt == 2))
+    token = get_valid_access_token(cfg.robinhood_client_id)
+    token_refreshed = False
+    session_reopened = False
+
+    while True:
+        session = _SESSION_CACHE.get(cfg.mcp_url)
+        if session is None:
+            session = _open_session(cfg.mcp_url, token)
+            _SESSION_CACHE[cfg.mcp_url] = session
+
         try:
-            session_id, negotiated_version = _open_session(cfg.mcp_url, token)
-            call_payload = {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
-            }
             _status, _headers, text = _post(
                 cfg.mcp_url,
                 token,
                 call_payload,
-                session_id=session_id,
-                protocol_version=negotiated_version,
+                session_id=session.session_id,
+                protocol_version=session.protocol_version,
             )
         except _HTTPStatusError as e:
-            if e.status == 401 and attempt == 1:
-                last_401 = e
+            if e.status == 401 and not token_refreshed:
+                token_refreshed = True
+                token = get_valid_access_token(cfg.robinhood_client_id, force_refresh=True)
+                _SESSION_CACHE.pop(cfg.mcp_url, None)
                 continue
+            if _is_session_error(e) and not session_reopened:
+                session_reopened = True
+                _SESSION_CACHE.pop(cfg.mcp_url, None)
+                continue
+            if e.status == 401:
+                raise MCPClientError(
+                    f"{tool_name} failed: HTTP 401 persisted after one forced token refresh: {e.body}"
+                ) from e
             raise MCPClientError(f"{tool_name} failed: HTTP {e.status}: {e.body}") from e
 
         message = _parse_sse_json_rpc(text)
@@ -215,10 +279,6 @@ def _call_tool(cfg: AgentConfig, tool_name: str, arguments: dict) -> dict:
         if result.get("isError"):
             raise MCPClientError(f"{tool_name} tool error: {result}")
         return result
-
-    raise MCPClientError(
-        f"{tool_name} failed: HTTP 401 persisted after one forced token refresh"
-    ) from last_401
 
 
 def _structured_data(result: dict) -> dict:
@@ -237,14 +297,36 @@ def _reject_if_paginated(data: dict, tool_name: str) -> None:
         )
 
 
+def _is_stale_previous_close(quote: dict) -> bool:
+    """True when `previous_close_date` has already rolled forward to the
+    same calendar date as the most recent trade — i.e. `adjusted_previous_
+    close` is today's own close, not yesterday's. Observed live (see
+    mcp_client.py's captured 2026-08-05 probe): right around/after the
+    close print, the server updates previous_close_date before a caller
+    has necessarily re-read it, and a day_change_pct computed against it
+    reads a spurious 0.00% — indistinguishable from "no move today" unless
+    a caller specifically checks for this. Missing/non-string fields on
+    either side are "can't tell" (False), not "assume stale".
+    """
+    previous_close_date = quote.get("previous_close_date")
+    last_trade_time = quote.get("venue_last_trade_time")
+    if not isinstance(previous_close_date, str) or not isinstance(last_trade_time, str):
+        return False
+    if len(previous_close_date) < 10 or len(last_trade_time) < 10:
+        return False
+    return previous_close_date[:10] == last_trade_time[:10]
+
+
 def fetch_quotes(cfg: AgentConfig, symbols: list[str]) -> dict[str, dict]:
     """Fetch real-time quotes for `symbols` directly from the MCP server —
     no model in the loop. Returns each ticker's raw quote fields exactly as
     the server reports them (last_trade_price, last_non_reg_trade_price,
     adjusted_previous_close, etc. — all as the STRINGS the server sends),
-    keyed by uppercased ticker. A symbol the server didn't return a quote
-    for is simply absent from the result, the same "missing means missing"
-    convention agent.py's own snapshot recomputation already uses.
+    keyed by uppercased ticker, plus one computed field this module adds
+    itself: `stale_previous_close` (bool — see _is_stale_previous_close).
+    A symbol the server didn't return a quote for is simply absent from
+    the result, the same "missing means missing" convention agent.py's own
+    snapshot recomputation already uses.
     """
     result = _call_tool(cfg, "get_equity_quotes", {"symbols": list(symbols)})
     data = _structured_data(result)
@@ -256,6 +338,8 @@ def fetch_quotes(cfg: AgentConfig, symbols: list[str]) -> dict[str, dict]:
             continue
         quote = entry.get("quote")
         if isinstance(quote, dict) and quote.get("symbol"):
+            quote = dict(quote)
+            quote["stale_previous_close"] = _is_stale_previous_close(quote)
             quotes[str(quote["symbol"]).upper().strip()] = quote
     return quotes
 

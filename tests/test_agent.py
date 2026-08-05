@@ -24,11 +24,13 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent import (
+    _drop_buys_for_stale_tickers,
     _execute_and_reconcile,
     _quote_field_falsified,
     _recompute_snapshot,
     _session_prices_diverge,
     _snapshot_diverges_from_model,
+    _stale_previous_close_tickers,
     _verify_inputs_against_live_quotes,
     run_cycle,
 )
@@ -1246,6 +1248,163 @@ class TestVerifyInputsAgainstLiveQuotes:
 
         assert result == recomputed
         assert not os.path.exists(cfg.log_file)
+
+    def test_stale_previous_close_is_carried_onto_the_verified_entry(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_quotes",
+            lambda cfg, symbols: {
+                "AAPL": {
+                    "last_trade_price": "92.00",
+                    "last_non_reg_trade_price": None,
+                    "adjusted_previous_close": "100.00",
+                    "stale_previous_close": True,
+                }
+            },
+        )
+
+        cfg = _cfg(tmp_path, verify_inputs=True)
+        recomputed = {
+            "AAPL": {
+                "current_price": 92.0,
+                "day_change_pct": -8.0,
+                "last_trade_price": 92.0,
+                "last_non_reg_trade_price": None,
+                "adjusted_previous_close": 100.0,
+            }
+        }
+
+        result = _verify_inputs_against_live_quotes(cfg, recomputed)
+
+        assert result["AAPL"]["stale_previous_close"] is True
+        # Values that weren't falsified stay the model's own (no falsified
+        # field here — only the stale flag is new).
+        assert result["AAPL"]["day_change_pct"] == -8.0
+
+
+class TestStalePreviousCloseHelpers:
+    def test_stale_previous_close_tickers_collects_flagged_entries_only(self):
+        recomputed = {
+            "AAPL": {"day_change_pct": 0.0, "stale_previous_close": True},
+            "MSFT": {"day_change_pct": -3.0},
+            "VOO": {"day_change_pct": 1.0, "stale_previous_close": False},
+        }
+        assert _stale_previous_close_tickers(recomputed) == ["AAPL"]
+
+    def test_drop_buys_for_stale_tickers_only_removes_matching_buys(self):
+        orders = [
+            {"ticker": "AAPL", "side": "buy"},
+            {"ticker": "AAPL", "side": "sell"},
+            {"ticker": "MSFT", "side": "buy"},
+        ]
+        result = _drop_buys_for_stale_tickers(orders, ["AAPL"])
+        assert result == [
+            {"ticker": "AAPL", "side": "sell"},
+            {"ticker": "MSFT", "side": "buy"},
+        ]
+
+    def test_drop_buys_for_stale_tickers_is_a_no_op_with_no_stale_tickers(self):
+        orders = [{"ticker": "AAPL", "side": "buy"}]
+        assert _drop_buys_for_stale_tickers(orders, []) == orders
+
+
+class TestStalePreviousCloseEndToEnd:
+    """mcp_client.fetch_quotes() flags stale_previous_close when a
+    ticker's previous_close_date has rolled forward to match its own last
+    trade's date — adjusted_previous_close is today's own close, so
+    day_change_pct would compute to a spurious 0.00%. run_cycle() must
+    skip proposing buys for that ticker rather than silently treating the
+    missing signal as "no move today"."""
+
+    def test_stale_ticker_buy_is_skipped_and_others_are_unaffected(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        def _fake_fetch_quotes(cfg, symbols):
+            return {
+                "AAPL": {
+                    "last_trade_price": "309.38",
+                    "last_non_reg_trade_price": None,
+                    "adjusted_previous_close": "309.38",
+                    "stale_previous_close": True,
+                },
+                "MSFT": {
+                    "last_trade_price": "410.00",
+                    "last_non_reg_trade_price": None,
+                    "adjusted_previous_close": "445.65",
+                    "stale_previous_close": False,
+                },
+            }
+
+        monkeypatch.setattr(agent_module, "fetch_quotes", _fake_fetch_quotes)
+
+        cfg = _cfg(tmp_path, dry_run=True, verify_inputs=True, watchlist=("AAPL", "MSFT"))
+        aapl_order = {
+            "ticker": "AAPL",
+            "side": "buy",
+            "dollars": 25.0,
+            "day_change_pct": 0.0,
+            "current_price": 309.38,
+            "positions": {},
+            "reason": "should never fire — stale previous close",
+        }
+        msft_order = {
+            "ticker": "MSFT",
+            "side": "buy",
+            "dollars": 25.0,
+            "day_change_pct": -8.0,
+            "current_price": 410.00,
+            "positions": {},
+            "reason": "real dip, should still fire",
+        }
+        snapshot = {
+            "AAPL": _snapshot_entry_for(309.38, 0.0),
+            "MSFT": _snapshot_entry_for(410.00, -8.0),
+        }
+        client = _FakeClient(
+            [_FakeResponse(_cycle_report([aapl_order, msft_order], market_snapshot=snapshot))]
+        )
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        stale_events = [e for e in events if e["event"] == "stale_previous_close"]
+        assert len(stale_events) == 1
+        assert stale_events[0]["tickers"] == ["AAPL"]
+
+        fills = [e for e in events if e["event"] == "simulated_fill"]
+        assert len(fills) == 1
+        assert fills[0]["ticker"] == "MSFT"
+
+        portfolio = load_paper_portfolio(cfg.paper_portfolio_file, cfg.initial_cash)
+        assert "AAPL" not in portfolio.positions
+        assert "MSFT" in portfolio.positions
+
+    def test_no_stale_tickers_logs_no_event(self, tmp_path, monkeypatch):
+        import agent as agent_module
+
+        monkeypatch.setattr(
+            agent_module,
+            "fetch_quotes",
+            lambda cfg, symbols: {
+                "AAPL": {
+                    "last_trade_price": "92.00",
+                    "last_non_reg_trade_price": None,
+                    "adjusted_previous_close": "100.00",
+                    "stale_previous_close": False,
+                }
+            },
+        )
+
+        cfg = _cfg(tmp_path, dry_run=True, verify_inputs=True)
+        client = _FakeClient([_FakeResponse(_cycle_report([_approved_buy_order()]))])
+
+        run_cycle(cfg, client=client)
+
+        events = _read_log_events(cfg.log_file)
+        assert not any(e["event"] == "stale_previous_close" for e in events)
+        assert any(e["event"] == "simulated_fill" for e in events)
 
 
 class TestReconciliationAgainstDirectlyFetchedOrders:

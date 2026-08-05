@@ -71,6 +71,18 @@ def _http_error(status: int, body: str = "") -> urllib.error.HTTPError:
 DEFAULT_SESSION_ID = "test-session-abc"
 
 
+@pytest.fixture(autouse=True)
+def _reset_mcp_session_cache():
+    """mcp_client._SESSION_CACHE is a module-level dict keyed by mcp_url —
+    every test in this file uses the same fake URL (_cfg()'s default), so
+    without a reset a session cached by one test would silently carry over
+    into the next and break tests that assert on the initialize/
+    notifications/initialized handshake happening."""
+    mcp_client._SESSION_CACHE.clear()
+    yield
+    mcp_client._SESSION_CACHE.clear()
+
+
 def _queue_key(payload: dict) -> str:
     """Requests are keyed by tool name for tools/call (since every tool
     call shares the JSON-RPC method "tools/call" — the tool itself is in
@@ -178,6 +190,10 @@ class TestFetchQuotes:
                 "last_trade_price": "309.380000",
                 "last_non_reg_trade_price": "310.660000",
                 "adjusted_previous_close": "303.420000",
+                # No previous_close_date/venue_last_trade_time in this
+                # fixture, so _is_stale_previous_close can't tell — see
+                # TestStalePreviousClose for cases where it can.
+                "stale_previous_close": False,
             }
         }
 
@@ -537,3 +553,213 @@ class TestErrorHandling:
 
         with pytest.raises(MCPClientError, match="no SSE"):
             fetch_quotes(_cfg(), ["AAPL"])
+
+
+class TestSSEFraming:
+    def test_body_with_multiple_data_lines_parses_the_first_frame(self, monkeypatch):
+        # Not a shape ever observed from the live server for a single
+        # tools/call response, but _parse_sse_json_rpc() must behave
+        # deterministically (use the first `data:` line, ignore the rest)
+        # rather than concatenating, picking the last, or raising.
+        transport = _ScriptedTransport()
+        monkeypatch.setattr(mcp_client.urllib.request, "urlopen", transport.urlopen)
+        monkeypatch.setattr(mcp_client, "get_valid_access_token", lambda client_id, force_refresh=False: "tok")
+
+        first = {"jsonrpc": "2.0", "id": 2, "result": {"structuredContent": {"data": {"results": []}}}}
+        second = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "structuredContent": {
+                    "data": {"results": [{"quote": {"symbol": "SHOULD_NOT_BE_USED"}}]}
+                }
+            },
+        }
+        body = f"event: message\ndata: {json.dumps(first)}\n\nevent: message\ndata: {json.dumps(second)}\n\n"
+        transport.queue(
+            "get_equity_quotes",
+            _FakeHTTPResponse(200, {"Content-Type": "text/event-stream"}, body),
+        )
+
+        result = fetch_quotes(_cfg(), ["AAPL"])
+
+        assert result == {}
+
+
+class TestSessionCaching:
+    def test_second_call_reuses_the_cached_session_without_reinitializing(self, monkeypatch):
+        transport = _ScriptedTransport()
+        monkeypatch.setattr(mcp_client.urllib.request, "urlopen", transport.urlopen)
+        monkeypatch.setattr(mcp_client, "get_valid_access_token", lambda client_id, force_refresh=False: "tok")
+
+        transport.queue(
+            "get_equity_quotes",
+            _tool_result_response(2, {"results": []}),
+            _tool_result_response(2, {"results": []}),
+        )
+
+        fetch_quotes(_cfg(), ["AAPL"])
+        fetch_quotes(_cfg(), ["MSFT"])
+
+        init_requests = [r for r in transport.requests if r.get("method") == "initialize"]
+        assert len(init_requests) == 1
+
+        tool_calls = [r for r in transport.requests if _queue_key(r) == "get_equity_quotes"]
+        assert len(tool_calls) == 2
+
+    def test_cached_session_is_shared_across_two_tools_in_one_call(self, monkeypatch):
+        # fetch_positions() calls get_equity_positions then (internally)
+        # fetch_quotes() -> get_equity_quotes. With a cached session, that
+        # should be one handshake for both, not one each.
+        transport = _ScriptedTransport()
+        monkeypatch.setattr(mcp_client.urllib.request, "urlopen", transport.urlopen)
+        monkeypatch.setattr(mcp_client, "get_valid_access_token", lambda client_id, force_refresh=False: "tok")
+
+        transport.queue(
+            "get_equity_positions",
+            _tool_result_response(
+                2, {"positions": [{"symbol": "AAPL", "quantity": "1", "type": "long"}]}
+            ),
+        )
+        transport.queue(
+            "get_equity_quotes",
+            _tool_result_response(2, {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "120.00"}}]}),
+        )
+
+        fetch_positions(_cfg(), "602437931")
+
+        init_requests = [r for r in transport.requests if r.get("method") == "initialize"]
+        assert len(init_requests) == 1
+
+
+class TestSessionErrorReinit:
+    def test_session_error_triggers_exactly_one_reinitialize_and_retry(self, monkeypatch):
+        transport = _ScriptedTransport()
+        monkeypatch.setattr(mcp_client.urllib.request, "urlopen", transport.urlopen)
+        monkeypatch.setattr(mcp_client, "get_valid_access_token", lambda client_id, force_refresh=False: "tok")
+
+        transport.queue(
+            "get_equity_quotes",
+            _http_error(404, "session not found"),
+            _tool_result_response(2, {"results": []}),
+        )
+
+        result = fetch_quotes(_cfg(), ["AAPL"])
+
+        assert result == {}
+        init_requests = [r for r in transport.requests if r.get("method") == "initialize"]
+        assert len(init_requests) == 2  # original session + the one reinit after the 404
+
+    def test_session_error_persisting_after_reinit_fails_loudly(self, monkeypatch):
+        transport = _ScriptedTransport()
+        monkeypatch.setattr(mcp_client.urllib.request, "urlopen", transport.urlopen)
+        monkeypatch.setattr(mcp_client, "get_valid_access_token", lambda client_id, force_refresh=False: "tok")
+
+        transport.queue(
+            "get_equity_quotes",
+            _http_error(404, "session not found"),
+            _http_error(404, "still not found"),
+        )
+
+        with pytest.raises(MCPClientError, match="404"):
+            fetch_quotes(_cfg(), ["AAPL"])
+
+    def test_session_error_does_not_also_force_a_token_refresh(self, monkeypatch):
+        # A 404 is a session problem, not an auth problem — retrying it
+        # should not spend the 401 branch's one-time forced token refresh.
+        transport = _ScriptedTransport()
+        monkeypatch.setattr(mcp_client.urllib.request, "urlopen", transport.urlopen)
+
+        force_refresh_calls = []
+
+        def _fake_get_token(client_id, force_refresh=False):
+            force_refresh_calls.append(force_refresh)
+            return "tok"
+
+        monkeypatch.setattr(mcp_client, "get_valid_access_token", _fake_get_token)
+
+        transport.queue(
+            "get_equity_quotes",
+            _http_error(404, "session not found"),
+            _tool_result_response(2, {"results": []}),
+        )
+
+        fetch_quotes(_cfg(), ["AAPL"])
+
+        assert force_refresh_calls == [False]
+
+
+class TestStalePreviousClose:
+    def test_flagged_when_previous_close_date_matches_last_trade_date(self, monkeypatch):
+        transport = _ScriptedTransport()
+        monkeypatch.setattr(mcp_client.urllib.request, "urlopen", transport.urlopen)
+        monkeypatch.setattr(mcp_client, "get_valid_access_token", lambda client_id, force_refresh=False: "tok")
+
+        transport.queue(
+            "get_equity_quotes",
+            _tool_result_response(
+                2,
+                {
+                    "results": [
+                        {
+                            "quote": {
+                                "symbol": "AAPL",
+                                "last_trade_price": "309.380000",
+                                "venue_last_trade_time": "2026-08-04T19:59:59.999857826Z",
+                                "adjusted_previous_close": "309.380000",
+                                "previous_close_date": "2026-08-04",
+                            }
+                        }
+                    ]
+                },
+            ),
+        )
+
+        result = fetch_quotes(_cfg(), ["AAPL"])
+
+        assert result["AAPL"]["stale_previous_close"] is True
+
+    def test_not_flagged_when_previous_close_date_precedes_last_trade_date(self, monkeypatch):
+        transport = _ScriptedTransport()
+        monkeypatch.setattr(mcp_client.urllib.request, "urlopen", transport.urlopen)
+        monkeypatch.setattr(mcp_client, "get_valid_access_token", lambda client_id, force_refresh=False: "tok")
+
+        transport.queue(
+            "get_equity_quotes",
+            _tool_result_response(
+                2,
+                {
+                    "results": [
+                        {
+                            "quote": {
+                                "symbol": "AAPL",
+                                "last_trade_price": "309.380000",
+                                "venue_last_trade_time": "2026-08-04T19:59:59.999857826Z",
+                                "adjusted_previous_close": "303.420000",
+                                "previous_close_date": "2026-08-03",
+                            }
+                        }
+                    ]
+                },
+            ),
+        )
+
+        result = fetch_quotes(_cfg(), ["AAPL"])
+
+        assert result["AAPL"]["stale_previous_close"] is False
+
+    def test_missing_fields_are_not_flagged(self, monkeypatch):
+        transport = _ScriptedTransport()
+        monkeypatch.setattr(mcp_client.urllib.request, "urlopen", transport.urlopen)
+        monkeypatch.setattr(mcp_client, "get_valid_access_token", lambda client_id, force_refresh=False: "tok")
+
+        transport.queue(
+            "get_equity_quotes",
+            _tool_result_response(
+                2, {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "309.38"}}]}
+            ),
+        )
+
+        result = fetch_quotes(_cfg(), ["AAPL"])
+
+        assert result["AAPL"]["stale_previous_close"] is False

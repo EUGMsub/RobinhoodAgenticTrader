@@ -207,6 +207,17 @@ Stated plainly because they're real, and because a reviewer will find them.
    is a config flag, not a removed code path: with it set to `False`,
    quote-field falsification is unverified too (see
    `TestInputFalsificationIsNotDefendedWhenVerificationIsOff`).
+   **Also closed:** `fetch_quotes()` now detects a second, distinct
+   data-integrity gap — a stale `previous_close_date` (see
+   `mcp_client._is_stale_previous_close`) that has rolled
+   `adjusted_previous_close` forward to today's own close, which would
+   otherwise make a real move read as a spurious 0.00% day change and be
+   silently treated as "nothing happened." `run_cycle()` logs a
+   `stale_previous_close` event naming the affected tickers and drops buy
+   proposals for them entirely, rather than evaluating a manufactured
+   "no move" reading against the dip trigger. Covered by
+   `tests/test_mcp_client.py`'s `TestStalePreviousClose` and
+   `tests/test_agent.py`'s `TestStalePreviousCloseEndToEnd`.
 2. **~~Reconciliation was model-mediated.~~ Fixed.** The same model that
    executed an order used to be asked, in a second LLM call, to also report
    what it did — worth little against anything adversarial, and it cost real
@@ -216,7 +227,17 @@ Stated plainly because they're real, and because a reviewer will find them.
    `reconcile.reconcile_order()` unchanged. `tests/test_agent.py`'s
    `TestReconciliationAgainstDirectlyFetchedOrders` confirms it still catches
    an option order or a dollar-amount mismatch the same way it always did,
-   against the new data source.
+   against the new data source. `mcp_client.py`'s session handling changed
+   underneath this too: a session (the `initialize` handshake's result) is
+   now opened lazily and cached per `mcp_url` for the life of the process,
+   instead of re-handshaking on every tool call — so a single cycle's
+   `fetch_quotes()` (input verification) and `fetch_orders()`
+   (reconciliation) calls share one session rather than opening two. A
+   session error (observed on this transport as an HTTP 404) triggers
+   exactly one automatic re-initialize-and-retry, the same one-shot
+   discipline the existing 401-refresh-and-retry already used. See
+   `tests/test_mcp_client.py`'s `TestSessionCaching` and
+   `TestSessionErrorReinit`.
 3. **Capacity/reconciliation seam.** `running_positions` updates on
    approve-and-execute, before reconciliation runs. If reconciliation flags a
    mismatch, capacity was already assumed spent. Fails conservative.
@@ -326,7 +347,7 @@ Stated plainly because they're real, and because a reviewer will find them.
 git clone https://github.com/EUGMsub/RobinhoodAgenticTrader.git
 cd RobinhoodAgenticTrader
 pip install -r requirements.txt
-pytest tests/ -v          # 250 tests (241 pass, 9 skipped by default), no credentials needed
+pytest tests/ -v          # 265 tests (256 pass, 9 skipped by default), no credentials needed
 ```
 
 Reproduce the backtest (no credentials, no funded account):
@@ -362,7 +383,7 @@ src/
   mcp_client.py     direct HTTP MCP client (quotes/positions/orders) - no model
   backtest.py       pure replay engine - reuses guardrails unchanged
   logging_utils.py  append-only structured audit log
-tests/              250 tests (241 pass, 9 skipped by default), no network
+tests/              265 tests (256 pass, 9 skipped by default), no network
                     calls unless RUN_LIVE_INJECTION_TESTS=1 is set
 scripts/
   run_agent.py        live agent entry point
