@@ -1,5 +1,7 @@
 # Robinhood Agentic Trader
 
+[![Tests](https://github.com/EUGMsub/RobinhoodAgenticTrader/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/EUGMsub/RobinhoodAgenticTrader/actions/workflows/tests.yml)
+
 A guardrailed LLM trading agent built on the **Claude API's MCP connector** and
 **Robinhood's Agentic Trading MCP server**. Claude reads live market data and
 proposes trades in natural language; a separate layer of pure, unit-tested

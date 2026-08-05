@@ -1,0 +1,58 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ubuntu-latest matters specifically here: tests/test_oauth.py has a
+      # POSIX-only test asserting owner-only permissions on the file that
+      # holds brokerage OAuth tokens (skipped on Windows, where chmod bits
+      # don't apply) — this is the only runner in the matrix where it
+      # actually executes. No secrets, no credentials, no real network
+      # call: every test uses a fake HTTP/Anthropic client, and the opt-in
+      # live injection tests in test_injection_live.py stay skipped since
+      # RUN_LIVE_INJECTION_TESTS is never set here.
+      - name: Run tests
+        run: pytest tests/ -v
+
+  verify-claims:
+    name: Verify README claims
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Automates two checks this repo's pre-commit-review skill otherwise
+      # does by hand: the test count README.md states matches what pytest
+      # actually reports, and no test file (outside the one deliberately
+      # opt-in live module) imports a real network client. See the
+      # script's own docstring for details.
+      - name: Verify test-count and no-network claims
+        run: python .github/scripts/verify_claims.py
