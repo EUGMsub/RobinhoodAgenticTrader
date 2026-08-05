@@ -26,11 +26,12 @@ its arithmetic, or its report of what it did.
 
 ## Status
 
-- ✅ 250 unit tests (`pytest tests/ -v`) — 241 passing; 9 skipped by
-  default (one POSIX-only file permission check on Windows, plus 8 opt-in
-  live prompt-injection probes that require `RUN_LIVE_INJECTION_TESTS=1`
-  and real credentials — see Known Limitations #4). No credentials required
-  to verify the 205.
+- ✅ 265 unit tests (`pytest tests/ -v`) — 257 passing, 8 skipped by
+  default on Linux (256 passing, 9 skipped on Windows, where one POSIX-only
+  file permission check doesn't run). The remaining skips are opt-in live
+  prompt-injection probes that require `RUN_LIVE_INJECTION_TESTS=1` and real
+  credentials — see Known Limitations #4. No credentials required to verify
+  the rest.
 - ✅ Backtested against ~2 years of real daily bars. Results below.
 - ✅ Agent orchestration, MCP wiring, batch validation, instrument-type
   enforcement, post-execution reconciliation, CLI approval flow.
@@ -349,7 +350,8 @@ Stated plainly because they're real, and because a reviewer will find them.
 git clone https://github.com/EUGMsub/RobinhoodAgenticTrader.git
 cd RobinhoodAgenticTrader
 pip install -r requirements.txt
-pytest tests/ -v          # 265 tests (256 pass, 9 skipped by default), no credentials needed
+pytest tests/ -v          # 265 tests (257 pass, 8 skipped by default), no credentials needed
+                          # (256 pass, 9 skipped on Windows - one POSIX-only test doesn't run there)
 ```
 
 Reproduce the backtest (no credentials, no funded account):
@@ -385,8 +387,9 @@ src/
   mcp_client.py     direct HTTP MCP client (quotes/positions/orders) - no model
   backtest.py       pure replay engine - reuses guardrails unchanged
   logging_utils.py  append-only structured audit log
-tests/              265 tests (256 pass, 9 skipped by default), no network
-                    calls unless RUN_LIVE_INJECTION_TESTS=1 is set
+tests/              265 tests (257 pass, 8 skipped by default; 256 pass,
+                    9 skipped on Windows), no network calls unless
+                    RUN_LIVE_INJECTION_TESTS=1 is set
 scripts/
   run_agent.py        live agent entry point
   oauth_login.py      one-time interactive OAuth login
