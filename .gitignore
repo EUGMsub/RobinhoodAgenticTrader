@@ -27,3 +27,7 @@ data/
 .oauth_tokens.json
 *.token.json
 tokens/
+
+# MCP discovery probe output — may contain bearer tokens in header dumps
+probe_output.txt
+probe_*.txt
